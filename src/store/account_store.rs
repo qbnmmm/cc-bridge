@@ -288,18 +288,20 @@ impl AccountStore {
         let expires_at = a.expires_at.map(|t| self.fmt_time(t));
         let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
+        let prompt_str = serde_json::to_string(&a.canonical_prompt).unwrap_or_else(|_| "{}".into());
         let q = format!(
             r#"UPDATE accounts SET name=$1, email=$2, status=$3, token=$4,
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid={}, organization_uuid={}, subscription_type={},
-                concurrency=$16, priority=$17, auto_telemetry=$18, updated_at={}
-            WHERE id=$19"#,
+                concurrency=$16, priority=$17, auto_telemetry=$18, canonical_prompt_env={}, updated_at={}
+            WHERE id=$20"#,
             self.nullable_ts(8),
             self.nullable_ts(9),
             self.nullable(13),
             self.nullable(14),
             self.nullable(15),
+            self.jsonb(19),
             self.now_expr()
         );
         sqlx::query(&q)
@@ -321,6 +323,7 @@ impl AccountStore {
             .bind(a.concurrency)
             .bind(a.priority)
             .bind(auto_telemetry_int)
+            .bind(&prompt_str)
             .bind(a.id)
             .execute(&self.pool)
             .await?;
@@ -684,6 +687,46 @@ mod tests {
     async fn test_jsonb_postgres() {
         let store = make_store("postgres").await;
         assert_eq!(store.jsonb(1), "$1::JSONB");
+    }
+
+    #[tokio::test]
+    async fn update_persists_canonical_prompt_env_in_sqlite() {
+        let store = make_store("sqlite").await;
+        crate::store::db::migrate(&store.pool, "sqlite")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let mut account: Account = serde_json::from_value(serde_json::json!({
+            "id": 0,
+            "name": "prompt-test",
+            "email": "prompt@example.com",
+            "status": "active",
+            "auth_type": "setup_token",
+            "setup_token": "test-token",
+            "proxy_url": "",
+            "device_id": "test-device",
+            "canonical_env": {},
+            "canonical_prompt_env": {
+                "platform": "darwin",
+                "working_dir": "/Users/user/projects",
+                "future_field": {"enabled": true}
+            },
+            "canonical_process": {},
+            "billing_mode": "strip",
+            "concurrency": 3,
+            "priority": 50,
+            "created_at": now,
+            "updated_at": now
+        }))
+        .unwrap();
+        store.create(&mut account).await.unwrap();
+        account.canonical_prompt["working_dir"] = serde_json::json!("/workspace/project");
+
+        store.update(&account).await.unwrap();
+
+        let stored = store.get_by_id(account.id).await.unwrap();
+        assert_eq!(stored.canonical_prompt["working_dir"], "/workspace/project");
+        assert_eq!(stored.canonical_prompt["future_field"]["enabled"], true);
     }
 
     // ─── nullable() helper ───

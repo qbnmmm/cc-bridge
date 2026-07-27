@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
-import { api, type Account, type OAuthExchangeResult, type UsageData } from '../api';
+import { api, type Account, type OAuthExchangeResult, type UpdateAccountRequest, type UsageData } from '../api';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -47,6 +47,7 @@ const form = ref({
   concurrency: 5,
   priority: 50,
   auto_telemetry: false,
+  prompt_working_dir: '',
 });
 /** 正在测试的账号 ID */
 const testing = ref<number | null>(null);
@@ -123,6 +124,7 @@ function openCreate() {
     concurrency: 5,
     priority: 50,
     auto_telemetry: false,
+    prompt_working_dir: '',
   };
   showForm.value = true;
 }
@@ -149,6 +151,7 @@ function openEdit(a: Account) {
     concurrency: a.concurrency,
     priority: a.priority,
     auto_telemetry: a.auto_telemetry ?? false,
+    prompt_working_dir: a.canonical_prompt_env?.working_dir || '',
   };
   showForm.value = true;
 }
@@ -169,7 +172,8 @@ async function save() {
         && editing.value.auth_type !== 'oauth') {
         throw new Error('切换到 OAuth 模式时必须填写 Refresh Token');
       }
-      const updates: Record<string, unknown> = {};
+      const promptWorkingDir = normalizePromptWorkingDir(form.value.prompt_working_dir);
+      const updates: UpdateAccountRequest = {};
       if (form.value.name) updates.name = form.value.name;
       if (form.value.email) updates.email = form.value.email;
       updates.auth_type = form.value.auth_type;
@@ -185,6 +189,7 @@ async function save() {
       updates.concurrency = form.value.concurrency;
       updates.priority = form.value.priority;
       updates.auto_telemetry = form.value.auto_telemetry;
+      updates.prompt_working_dir = promptWorkingDir;
       await api.updateAccount(editing.value.id, updates);
     } else {
       if (form.value.auth_type === 'setup_token' && !form.value.setup_token.trim()) {
@@ -218,6 +223,14 @@ async function save() {
   } catch (e: unknown) {
     toast((e as Error).message || '保存失败');
   }
+}
+
+function normalizePromptWorkingDir(raw: string): string {
+  const path = raw.trim();
+  if (!path || !path.startsWith('/') || /\s/u.test(path) || [...path].length > 1024) {
+    throw new Error('提示词工作目录必须是不含空白字符的绝对路径，且不超过 1024 个字符');
+  }
+  return path;
 }
 
 function normalizeExpiresAtInput(raw: string): string | null {
@@ -554,6 +567,7 @@ function applyOAuthResult() {
     concurrency: 5,
     priority: 50,
     auto_telemetry: false,
+    prompt_working_dir: '',
   };
   showForm.value = true;
 }
@@ -1043,6 +1057,16 @@ async function copyText(text: string) {
               v-model="form.proxy_url"
               placeholder="http:// 或 socks5://"
               class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20"
+            />
+          </div>
+          <div v-if="editing" class="space-y-2">
+            <Label class="text-[#5c5647] text-sm">提示词工作目录</Label>
+            <Input
+              v-model="form.prompt_working_dir"
+              required
+              :maxlength="1024"
+              spellcheck="false"
+              class="bg-[#f9f6f1] border-[#e8e2d9] text-[#29261e] placeholder-[#b5b0a6] focus:border-[#c4704f] focus:ring-[#c4704f]/20 font-mono text-sm"
             />
           </div>
           <div class="space-y-2">

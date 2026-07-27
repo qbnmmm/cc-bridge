@@ -557,14 +557,16 @@ impl Rewriter {
                 .replace_all(&text, &format!("OS Version: {}", pe.os_version))
                 .to_string();
             text = WORKING_DIR_REGEX
-                .replace_all(&text, &format!("${{1}}{}", pe.working_dir))
+                .replace_all(&text, |caps: &regex::Captures| {
+                    format!("{}{}", &caps[1], pe.working_dir)
+                })
                 .to_string();
-            let home_prefix = if let Some(idx) = nth_index(&pe.working_dir, '/', 3) {
-                &pe.working_dir[..idx + 1]
-            } else {
-                &pe.working_dir
-            };
-            text = HOME_PATH_REGEX.replace_all(&text, home_prefix).to_string();
+            if let Some(home_prefix) = PROMPT_HOME_PREFIX_REGEX.find(&pe.working_dir) {
+                let replacement = home_prefix.as_str().to_string();
+                text = HOME_PATH_REGEX
+                    .replace_all(&text, |_: &regex::Captures| replacement.clone())
+                    .to_string();
+            }
             text
         };
 
@@ -816,6 +818,8 @@ static SHELL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Shell:\s*[^\n<]+").u
 static OS_VERSION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"OS Version:\s*[^\n<]+").unwrap());
 static WORKING_DIR_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"((?:Primary )?[Ww]orking directory:\s*)/\S+").unwrap());
+static PROMPT_HOME_PREFIX_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^/(?:Users|home)/[^/\s]+/").unwrap());
 static HOME_PATH_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"/(?:Users|home)/[^/\s]+/").unwrap());
 static BILLING_LINE_REGEX: Lazy<Regex> =
@@ -1248,19 +1252,6 @@ fn stainless_os_from_platform(platform: &str) -> &str {
     }
 }
 
-fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
-    let mut count = 0;
-    for (i, ch) in s.chars().enumerate() {
-        if ch == c {
-            count += 1;
-            if count == n {
-                return Some(i);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod beta_tests {
     use super::{compute_betas_for_model, strip_1m_suffix};
@@ -1348,9 +1339,124 @@ mod beta_tests {
 
     #[test]
     fn strip_1m_suffix_helper() {
-        assert_eq!(strip_1m_suffix("claude-sonnet-4-6[1m]"), ("claude-sonnet-4-6", true));
-        assert_eq!(strip_1m_suffix("claude-opus-4-7[1m]"), ("claude-opus-4-7", true));
-        assert_eq!(strip_1m_suffix("claude-sonnet-4-5-20250929"), ("claude-sonnet-4-5-20250929", false));
+        assert_eq!(
+            strip_1m_suffix("claude-sonnet-4-6[1m]"),
+            ("claude-sonnet-4-6", true)
+        );
+        assert_eq!(
+            strip_1m_suffix("claude-opus-4-7[1m]"),
+            ("claude-opus-4-7", true)
+        );
+        assert_eq!(
+            strip_1m_suffix("claude-sonnet-4-5-20250929"),
+            ("claude-sonnet-4-5-20250929", false)
+        );
         assert_eq!(strip_1m_suffix("[1m]"), ("", true));
+    }
+}
+
+#[cfg(test)]
+mod prompt_env_tests {
+    use super::Rewriter;
+    use crate::model::account::{BillingMode, CanonicalPromptEnvData};
+
+    fn prompt_env(working_dir: &str) -> CanonicalPromptEnvData {
+        CanonicalPromptEnvData {
+            platform: "darwin".into(),
+            shell: "zsh".into(),
+            os_version: "Darwin 24.4.0".into(),
+            working_dir: working_dir.into(),
+        }
+    }
+
+    #[test]
+    fn home_working_dir_rewrites_system_and_only_message_reminders() {
+        let mut body = serde_json::json!({
+            "system": "Working directory: /Users/old/project\nConfig: /Users/old/.claude/settings.json",
+            "messages": [{
+                "role": "user",
+                "content": "Outside: /Users/old/keep\n<system-reminder>Primary working directory: /Users/old/project\nConfig: /Users/old/.claude/config.json</system-reminder>"
+            }]
+        });
+
+        Rewriter::new().rewrite_system_prompt(
+            &mut body,
+            &prompt_env("/Users/dev/new-project"),
+            "2.1.81",
+            &BillingMode::Strip,
+        );
+
+        let system = body["system"].as_str().unwrap();
+        assert!(system.contains("Working directory: /Users/dev/new-project"));
+        assert!(system.contains("Config: /Users/dev/.claude/settings.json"));
+
+        let message = body["messages"][0]["content"].as_str().unwrap();
+        assert!(message.contains("Outside: /Users/old/keep"));
+        assert!(message.contains("Primary working directory: /Users/dev/new-project"));
+        assert!(message.contains("Config: /Users/dev/.claude/config.json"));
+    }
+
+    #[test]
+    fn non_home_working_dir_does_not_rewrite_home_paths() {
+        let mut body = serde_json::json!({
+            "system": "Working directory: /Users/old/project\nConfig: /Users/old/.claude/settings.json",
+            "messages": [{
+                "role": "user",
+                "content": "<system-reminder>Working directory: /Users/old/project\nConfig: /Users/old/.claude/config.json</system-reminder>"
+            }]
+        });
+
+        Rewriter::new().rewrite_system_prompt(
+            &mut body,
+            &prompt_env("/workspace/project"),
+            "2.1.81",
+            &BillingMode::Strip,
+        );
+
+        let system = body["system"].as_str().unwrap();
+        assert!(system.contains("Working directory: /workspace/project"));
+        assert!(system.contains("Config: /Users/old/.claude/settings.json"));
+
+        let message = body["messages"][0]["content"].as_str().unwrap();
+        assert!(message.contains("Working directory: /workspace/project"));
+        assert!(message.contains("Config: /Users/old/.claude/config.json"));
+    }
+
+    #[test]
+    fn unicode_working_dir_is_rewritten_without_panicking() {
+        let mut body = serde_json::json!({
+            "system": "Working directory: /Users/old/project"
+        });
+
+        Rewriter::new().rewrite_system_prompt(
+            &mut body,
+            &prompt_env("/Users/\u{5f00}\u{53d1}\u{8005}/\u{9879}\u{76ee}"),
+            "2.1.81",
+            &BillingMode::Strip,
+        );
+
+        assert_eq!(
+            body["system"],
+            "Working directory: /Users/\u{5f00}\u{53d1}\u{8005}/\u{9879}\u{76ee}"
+        );
+    }
+
+    #[test]
+    fn dollar_sign_in_working_dir_remains_literal() {
+        let mut body = serde_json::json!({
+            "system": "Working directory: /Users/old/project"
+        });
+
+        Rewriter::new().rewrite_system_prompt(
+            &mut body,
+            &prompt_env("/workspace/project$archive"),
+            "2.1.81",
+            &BillingMode::Strip,
+        );
+
+        assert_eq!(
+            body["system"],
+            "Working directory: /workspace/project$archive"
+        );
     }
 }

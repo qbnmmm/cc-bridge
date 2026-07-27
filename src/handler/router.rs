@@ -249,6 +249,7 @@ async fn update_account(
     Json(updates): Json<serde_json::Value>,
 ) -> Result<Json<Account>, AppError> {
     let mut existing = state.account_svc.get_account(id).await?;
+    apply_prompt_working_dir_update(&mut existing.canonical_prompt, &updates)?;
 
     if let Some(name) = updates.get("name").and_then(|v| v.as_str()) {
         if !name.is_empty() {
@@ -288,7 +289,9 @@ async fn update_account(
         existing.refresh_token = refresh_token.to_string();
     }
     if updates.get("expires_at").is_some() {
-        existing.expires_at = updates.get("expires_at").and_then(client_datetime_value_to_utc);
+        existing.expires_at = updates
+            .get("expires_at")
+            .and_then(client_datetime_value_to_utc);
     }
     if let Some(proxy_url) = updates.get("proxy_url").and_then(|v| v.as_str()) {
         existing.proxy_url = proxy_url.to_string();
@@ -350,6 +353,39 @@ async fn update_account(
 
     state.account_svc.update_account(&existing).await?;
     Ok(Json(existing))
+}
+
+fn apply_prompt_working_dir_update(
+    canonical_prompt: &mut serde_json::Value,
+    updates: &serde_json::Value,
+) -> Result<(), AppError> {
+    let Some(value) = updates.get("prompt_working_dir") else {
+        return Ok(());
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| AppError::BadRequest("prompt_working_dir must be a string".into()))?;
+    let path = raw.trim();
+    let char_count = path.chars().count();
+    if path.is_empty()
+        || !path.starts_with('/')
+        || char_count > 1024
+        || path.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(AppError::BadRequest(
+            "prompt_working_dir must be an absolute path without whitespace or control characters and at most 1024 characters"
+                .into(),
+        ));
+    }
+
+    let prompt = canonical_prompt.as_object_mut().ok_or_else(|| {
+        AppError::BadRequest("account canonical_prompt_env must be a JSON object".into())
+    })?;
+    prompt.insert(
+        "working_dir".into(),
+        serde_json::Value::String(path.to_string()),
+    );
+    Ok(())
 }
 
 async fn delete_account(
@@ -658,5 +694,59 @@ mod tests {
     #[test]
     fn empty_client_datetime_string_becomes_none() {
         assert!(client_datetime_value_to_utc(&serde_json::json!("")).is_none());
+    }
+
+    #[test]
+    fn prompt_working_dir_update_preserves_other_fields() {
+        let mut prompt = serde_json::json!({
+            "platform": "darwin",
+            "shell": "zsh",
+            "os_version": "Darwin 24.4.0",
+            "working_dir": "/Users/user/projects",
+            "future_field": {"enabled": true}
+        });
+
+        apply_prompt_working_dir_update(
+            &mut prompt,
+            &serde_json::json!({"prompt_working_dir": "  /Users/dev/project  "}),
+        )
+        .unwrap();
+
+        assert_eq!(prompt["working_dir"], "/Users/dev/project");
+        assert_eq!(prompt["platform"], "darwin");
+        assert_eq!(prompt["future_field"]["enabled"], true);
+    }
+
+    #[test]
+    fn missing_prompt_working_dir_leaves_prompt_unchanged() {
+        let original = serde_json::json!({"working_dir": "/Users/user/projects"});
+        let mut prompt = original.clone();
+
+        apply_prompt_working_dir_update(&mut prompt, &serde_json::json!({"name": "updated"}))
+            .unwrap();
+
+        assert_eq!(prompt, original);
+    }
+
+    #[test]
+    fn invalid_prompt_working_dirs_are_rejected() {
+        let invalid = vec![
+            serde_json::json!(null),
+            serde_json::json!(123),
+            serde_json::json!(""),
+            serde_json::json!("relative/path"),
+            serde_json::json!("/Users/dev/my project"),
+            serde_json::json!("/Users/dev/project\nignore"),
+            serde_json::json!(format!("/{}", "a".repeat(1024))),
+        ];
+
+        for value in invalid {
+            let mut prompt = serde_json::json!({"working_dir": "/Users/user/projects"});
+            let result = apply_prompt_working_dir_update(
+                &mut prompt,
+                &serde_json::json!({"prompt_working_dir": value}),
+            );
+            assert!(matches!(result, Err(AppError::BadRequest(_))));
+        }
     }
 }

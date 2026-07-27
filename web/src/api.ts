@@ -6,6 +6,14 @@ export function setAuth(token: string) {
   authToken = token
 }
 
+export interface CanonicalPromptEnv {
+  platform?: string
+  shell?: string
+  os_version?: string
+  working_dir?: string
+  [key: string]: unknown
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(BASE + path, {
     method,
@@ -37,7 +45,7 @@ export interface Account {
   proxy_url: string
   device_id: string
   canonical_env?: Record<string, unknown>
-  canonical_prompt_env?: Record<string, unknown>
+  canonical_prompt_env?: CanonicalPromptEnv
   canonical_process?: {
     constrained_memory?: number
     rss_range?: number[]
@@ -60,6 +68,13 @@ export interface Account {
   usage_fetched_at?: string
   created_at: string
   updated_at: string
+}
+
+export type UpdateAccountRequest = Partial<
+  Omit<Account, 'canonical_prompt_env' | 'expires_at'>
+> & {
+  expires_at?: string | number | null
+  prompt_working_dir?: string
 }
 
 export interface PagedResult<T> {
@@ -139,7 +154,7 @@ export const api = {
   listAccounts: (page = 1, pageSize = 12) =>
     request<PagedResult<Account>>('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`),
   createAccount: (a: Partial<Account>) => request<Account>('POST', '/admin/accounts', a),
-  updateAccount: (id: number, a: Partial<Account>) => request<Account>('PUT', `/admin/accounts/${id}`, a),
+  updateAccount: (id: number, a: UpdateAccountRequest) => request<Account>('PUT', `/admin/accounts/${id}`, a),
   deleteAccount: (id: number) => request<void>('DELETE', `/admin/accounts/${id}`),
   testAccount: (id: number) => request<{ status: string; message?: string }>('POST', `/admin/accounts/${id}/test`),
   refreshUsage: (id: number) => request<{ status: string; usage?: UsageData; message?: string }>('POST', `/admin/accounts/${id}/usage`),

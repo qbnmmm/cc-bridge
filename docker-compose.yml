@@ -1,11 +1,9 @@
 services:
   cc-bridge:
-    image: ghcr.io/mamoworks/cc-bridge:latest
+    image: ghcr.io/qbnmmm/cc-bridge:latest
     container_name: cc-bridge
     env_file:
       - .env
-    depends_on:
-      - postgres
     ports:
       - "${SERVER_PORT:-5674}:5674"
     volumes:

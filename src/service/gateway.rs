@@ -3,6 +3,7 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_core::Stream;
+use futures_util::StreamExt;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use crate::service::rewriter::{
     ClientType, Rewriter, clean_session_id_from_body, detect_client_type,
 };
 use crate::service::telemetry::TelemetryService;
+use crate::service::usage::{UsageAttempt, UsageContentEncoding, UsageService};
 use crate::store::cache::CacheStore;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
@@ -101,6 +103,7 @@ pub struct GatewayService {
     rewriter: Arc<Rewriter>,
     telemetry_svc: Arc<TelemetryService>,
     limit_store: Arc<crate::service::limit::LimitStore>,
+    usage_svc: Arc<UsageService>,
 }
 
 impl GatewayService {
@@ -109,12 +112,14 @@ impl GatewayService {
         rewriter: Arc<Rewriter>,
         telemetry_svc: Arc<TelemetryService>,
         limit_store: Arc<crate::service::limit::LimitStore>,
+        usage_svc: Arc<UsageService>,
     ) -> Self {
         Self {
             account_svc,
             rewriter,
             telemetry_svc,
             limit_store,
+            usage_svc,
         }
     }
 
@@ -281,11 +286,24 @@ impl GatewayService {
         } else {
             rewritten_body.clone()
         };
+        let final_model = rewritten_body_map
+            .get("model")
+            .and_then(|value| value.as_str())
+            .unwrap_or(model_id)
+            .to_string();
+        let is_stream = rewritten_body_map
+            .get("stream")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
         cp!("rewrite");
 
         let upstream_token = self.account_svc.resolve_upstream_token_with(&account).await?;
         let mut final_headers = rewritten_headers;
         final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
+        let usage_attempt = (path == "/v1/messages")
+            .then(|| api_token)
+            .flatten()
+            .map(|token| UsageAttempt::begin(account.id, token.id, final_model, is_stream));
         cp!("resolve_token");
 
         let resp = self
@@ -299,6 +317,7 @@ impl GatewayService {
                 slot,
                 &rid,
                 model_class,
+                usage_attempt,
             )
             .await?;
         cp!("forward_done");
@@ -348,6 +367,7 @@ impl GatewayService {
         slot: SlotHolder,
         rid: &str,
         model_class: crate::service::limit::ModelClass,
+        mut usage_attempt: Option<UsageAttempt>,
     ) -> Result<Response, AppError> {
         let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
         if !query.is_empty() {
@@ -391,6 +411,14 @@ impl GatewayService {
         perf_log(rid, "upstream_send_ttfb", send_t0.elapsed().as_secs_f64() * 1000.0);
 
         let status_code = resp.status().as_u16();
+        if let Some(attempt) = usage_attempt.as_mut() {
+            attempt.is_stream = usage_response_is_stream(resp.headers(), attempt.is_stream);
+            attempt.complete_response(
+                status_code,
+                upstream_request_id(resp.headers()),
+                usage_content_encoding(resp.headers()),
+            );
+        }
         debug!("upstream response: {}", status_code);
 
         // 处理认证失败：403 永久停用
@@ -437,13 +465,64 @@ impl GatewayService {
 
         // 流式传输响应体，并把 SlotHolder 搭载到 body 流上：
         // 只有 body 被读完、或客户端提前断开（axum drop body）时，槽位才会释放。
-        let body_stream = resp.bytes_stream();
-        let held_stream = SlotHeldStream::new(body_stream, slot);
-        let body = Body::from_stream(held_stream);
+        let body = if let Some(attempt) = usage_attempt {
+            let observed = self.usage_svc.observe_stream(resp.bytes_stream(), attempt);
+            if status_code == StatusCode::TOO_MANY_REQUESTS.as_u16()
+                || (500..=599).contains(&status_code)
+            {
+                drop(slot);
+                tokio::spawn(async move {
+                    let mut observed = Box::pin(observed);
+                    while observed.next().await.is_some() {}
+                });
+                Body::empty()
+            } else {
+                Body::from_stream(SlotHeldStream::new(observed, slot))
+            }
+        } else {
+            Body::from_stream(SlotHeldStream::new(resp.bytes_stream(), slot))
+        };
 
         response_builder
             .body(body)
             .map_err(|e| AppError::Internal(format!("build response: {}", e)))
+    }
+}
+
+fn upstream_request_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("request-id")
+        .or_else(|| headers.get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn usage_response_is_stream(headers: &HeaderMap, request_is_stream: bool) -> bool {
+    headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(|content_type| {
+            content_type
+                .split(';')
+                .next()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+        .unwrap_or(request_is_stream)
+}
+
+fn usage_content_encoding(headers: &HeaderMap) -> UsageContentEncoding {
+    let mut values = headers.get_all("content-encoding").iter();
+    let Some(value) = values.next() else {
+        return UsageContentEncoding::Identity;
+    };
+    if values.next().is_some() {
+        return UsageContentEncoding::Unsupported;
+    }
+    match value.to_str() {
+        Ok(value) => UsageContentEncoding::parse(Some(value)),
+        Err(_) => UsageContentEncoding::Unsupported,
     }
 }
 
@@ -479,7 +558,7 @@ fn is_gateway_fingerprint_header(name: &str) -> bool {
 ///
 /// - status 保留 429
 /// - body 替换为 GENERIC_429_BODY
-/// - content-type 固定 application/json；content-length 由 body 自动计算，跳过原值
+/// - content-type 固定 application/json；移除旧 content-length/content-encoding
 /// - 其它响应头原样保留（包括 `retry-after` 给客户端参考、以及 `anthropic-ratelimit-*` 系列）
 fn wrap_429_response(resp: Response) -> Response {
     const GENERIC_429_BODY: &str = concat!(
@@ -490,8 +569,11 @@ fn wrap_429_response(resp: Response) -> Response {
     let status = resp.status();
     let mut builder = Response::builder().status(status);
     for (k, v) in resp.headers() {
-        // content-length / content-type 会被新 body 覆盖；跳过避免冲突
-        if matches!(k.as_str(), "content-length" | "content-type") {
+        // 新 body 未压缩，旧的长度、类型和压缩编码都不能继续透传。
+        if matches!(
+            k.as_str(),
+            "content-length" | "content-type" | "content-encoding"
+        ) {
             continue;
         }
         builder = builder.header(k.clone(), v.clone());
@@ -513,7 +595,7 @@ fn wrap_429_response(resp: Response) -> Response {
 /// - status 保留上游原值（500 / 502 / 503 / 504 / 529 等）
 /// - body 替换为 GENERIC_5XX_BODY
 /// - 剥离：`x-request-id` / `request-id` / `cf-ray` / `server` / `via`
-/// - content-type 固定 application/json；content-length 由新 body 自动计算
+/// - content-type 固定 application/json；移除旧 content-length/content-encoding
 fn wrap_5xx_response(resp: Response) -> Response {
     const GENERIC_5XX_BODY: &str = concat!(
         r#"{"type":"error","error":{"type":"api_error","#,
@@ -524,7 +606,10 @@ fn wrap_5xx_response(resp: Response) -> Response {
     let mut builder = Response::builder().status(status);
     for (k, v) in resp.headers() {
         let name_lower = k.as_str().to_ascii_lowercase();
-        if matches!(name_lower.as_str(), "content-length" | "content-type") {
+        if matches!(
+            name_lower.as_str(),
+            "content-length" | "content-type" | "content-encoding"
+        ) {
             continue;
         }
         if matches!(
@@ -1028,6 +1113,50 @@ mod tests {
 
     use axum::body::to_bytes;
 
+    #[test]
+    fn usage_parser_follows_response_content_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            "Text/Event-Stream; charset=utf-8".parse().unwrap(),
+        );
+        assert!(usage_response_is_stream(&headers, false));
+
+        headers.insert("content-type", "application/json".parse().unwrap());
+        assert!(!usage_response_is_stream(&headers, true));
+
+        headers.remove("content-type");
+        assert!(usage_response_is_stream(&headers, true));
+        assert!(!usage_response_is_stream(&headers, false));
+    }
+
+    #[test]
+    fn usage_parser_follows_response_content_encoding() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            usage_content_encoding(&headers),
+            UsageContentEncoding::Identity
+        );
+
+        headers.insert("content-encoding", "GZip".parse().unwrap());
+        assert_eq!(
+            usage_content_encoding(&headers),
+            UsageContentEncoding::Gzip
+        );
+
+        headers.insert("content-encoding", "gzip, br".parse().unwrap());
+        assert_eq!(
+            usage_content_encoding(&headers),
+            UsageContentEncoding::Unsupported
+        );
+
+        headers.append("content-encoding", "zstd".parse().unwrap());
+        assert_eq!(
+            usage_content_encoding(&headers),
+            UsageContentEncoding::Unsupported
+        );
+    }
+
     fn make_429(headers: &[(&str, &str)], body: &[u8]) -> Response {
         let mut builder = Response::builder().status(StatusCode::TOO_MANY_REQUESTS);
         for (k, v) in headers {
@@ -1070,6 +1199,7 @@ mod tests {
             &[
                 ("content-length", "999"),
                 ("content-type", "text/html"),
+                ("content-encoding", "gzip"),
             ],
             b"<html>rate limited</html>",
         );
@@ -1082,6 +1212,7 @@ mod tests {
             cl_values.iter().all(|v| v.to_str().unwrap() != "999"),
             "旧的 content-length=999 不应保留"
         );
+        assert!(wrapped.headers().get("content-encoding").is_none());
     }
 
     #[tokio::test]
@@ -1160,6 +1291,7 @@ mod tests {
                 ("cf-ray", "8a2f1c9e7d5b2a4e-SJC"),
                 ("server", "cloudflare"),
                 ("via", "1.1 cloudflare"),
+                ("content-encoding", "br"),
                 ("retry-after", "30"),
                 ("x-custom-debug", "keep-me"),
             ],
@@ -1168,7 +1300,13 @@ mod tests {
         let wrapped = wrap_5xx_response(original);
 
         // 追踪类 header 必须被剥离
-        for h in ["x-request-id", "cf-ray", "server", "via"] {
+        for h in [
+            "x-request-id",
+            "cf-ray",
+            "server",
+            "via",
+            "content-encoding",
+        ] {
             assert!(
                 wrapped.headers().get(h).is_none(),
                 "header {} 应被剥离",

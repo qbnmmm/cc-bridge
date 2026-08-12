@@ -14,7 +14,7 @@ export interface CanonicalPromptEnv {
   [key: string]: unknown
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch(BASE + path, {
     method,
     headers: {
@@ -22,6 +22,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       'Authorization': `Bearer ${authToken}`,
     },
     body: body ? JSON.stringify(body) : undefined,
+    signal,
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
@@ -134,6 +135,85 @@ export interface Dashboard {
   tokens: number;
 }
 
+export type UsageGranularity = 'day' | 'week' | 'month'
+export type UsageGroupBy = 'account' | 'api_token' | 'model'
+
+export interface UsageTokens {
+  input: number
+  output: number
+  cache_creation_5m: number
+  cache_creation_1h: number
+  cache_read: number
+  total: number
+}
+
+export interface UsageMetrics {
+  request_count: number
+  tokens: UsageTokens
+  known_cost_nano_usd: string
+  cost_complete: boolean
+  unpriced_request_count: number
+  unpriced_tokens: number
+}
+
+export interface UsageBucket {
+  key: string
+  start_date: string
+  end_date: string
+  start_at_utc: string
+  end_at_utc_exclusive: string
+  metrics: UsageMetrics
+}
+
+export interface UsageBreakdownRow {
+  key: string
+  label: string
+  metrics: UsageMetrics
+}
+
+export interface UsageIngestionHealth {
+  since_utc: string
+  queue_depth: number
+  observed_total: number
+  persisted_total: number
+  duplicate_total: number
+  queue_dropped_total: number
+  write_failed_total: number
+  parse_failed_total: number
+  parse_oversize_total: number
+}
+
+export interface UsageReport {
+  timezone: 'Asia/Singapore'
+  granularity: UsageGranularity
+  range: { start_date: string; end_date: string }
+  summary: UsageMetrics
+  buckets: UsageBucket[]
+  breakdown: UsageBreakdownRow[]
+  ingestion: UsageIngestionHealth
+}
+
+export interface UsageDimensionOption {
+  id: number
+  label: string
+}
+
+export interface UsageDimensions {
+  accounts: UsageDimensionOption[]
+  api_tokens: UsageDimensionOption[]
+  models: string[]
+}
+
+export interface UsageQueryParams {
+  granularity: UsageGranularity
+  start_date: string
+  end_date: string
+  account_id?: number
+  api_token_id?: number
+  model?: string
+  group_by: UsageGroupBy
+}
+
 export interface OAuthGenerateResult {
   auth_url: string;
   session_id: string;
@@ -164,6 +244,19 @@ export const api = {
   updateToken: (id: number, t: Partial<ApiToken>) => request<ApiToken>('PUT', `/admin/tokens/${id}`, t),
   deleteToken: (id: number) => request<void>('DELETE', `/admin/tokens/${id}`),
   getDashboard: () => request<Dashboard>('GET', '/admin/dashboard'),
+  getUsage: (params: UsageQueryParams, signal?: AbortSignal) => {
+    const query = new URLSearchParams({
+      granularity: params.granularity,
+      start_date: params.start_date,
+      end_date: params.end_date,
+      group_by: params.group_by,
+    })
+    if (params.account_id) query.set('account_id', String(params.account_id))
+    if (params.api_token_id) query.set('api_token_id', String(params.api_token_id))
+    if (params.model) query.set('model', params.model)
+    return request<UsageReport>('GET', `/admin/usage?${query.toString()}`, undefined, signal)
+  },
+  getUsageDimensions: () => request<UsageDimensions>('GET', '/admin/usage/dimensions'),
 
   generateAuthUrl: (proxyUrl?: string) =>
     request<OAuthGenerateResult>('POST', '/admin/oauth/generate-auth-url', { proxy_url: proxyUrl || null }),

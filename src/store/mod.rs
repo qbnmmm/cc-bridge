@@ -4,3 +4,4 @@ pub mod db;
 pub mod memory;
 pub mod redis;
 pub mod token_store;
+pub mod usage_store;

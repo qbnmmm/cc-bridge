@@ -220,6 +220,7 @@ curl http://127.0.0.1:5674/v1/messages \
 | `DATABASE_USER` | `POSTGRES_USER` 或 `postgres` | PostgreSQL 用户名 |
 | `DATABASE_PASSWORD` | `POSTGRES_PASSWORD` 或空 | PostgreSQL 密码 |
 | `DATABASE_DBNAME` | `POSTGRES_DB` 或 `claude_code_gateway` | PostgreSQL 数据库名 |
+| `USAGE_PRICING_OVERRIDES_JSON` | - | 可选的 exact-model 历史用量价格覆盖，费率使用十进制字符串，单位 USD / 百万 token；无效配置会阻止启动 |
 
 > SQLite 自动创建目录并启用 WAL 模式。PostgreSQL 在未提供 `DATABASE_DSN` 时，会先拉起根目录 `docker-compose.yml` 里的 `postgres` 服务，然后自动创建 `DATABASE_DBNAME` 指定的数据库。
 
@@ -343,6 +344,8 @@ cd docker && docker compose up -d
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/admin/dashboard` | 仪表盘统计 |
+| `GET` | `/admin/usage` | 历史用量汇总（`day` / `week` / `month`，支持账号、API Token、模型筛选与拆分） |
+| `GET` | `/admin/usage/dimensions` | 历史用量可筛选维度 |
 | `GET` | `/admin/accounts` | 账号列表（`page`/`page_size`） |
 | `POST` | `/admin/accounts` | 创建账号 |
 | `PUT` | `/admin/accounts/:id` | 更新账号 |
@@ -364,7 +367,7 @@ cd docker && docker compose up -d
 
 ### 保留路径
 
-`/`、`/login`、`/tokens`、`/favicon.svg`、`/assets/*`、`/admin/*` 不进入网关。
+`/`、`/login`、`/tokens`、`/usage`、`/favicon.svg`、`/assets/*`、`/admin/*` 不进入网关。
 
 ### 创建账号示例
 
@@ -670,6 +673,20 @@ cc-bridge/
 
 `POST /admin/accounts/:id/usage` 主动调 Anthropic `/api/oauth/usage`（**仅 OAuth 账号**；SetupToken 返回用户友好错误）。60 秒 DB 级去抖动。结果写入 `usage_data` 并同步到 `LimitStore` 内存热态。前端 Accounts 页面打开期间每 60 秒重新拉账号列表，从 DB 读取最新 `usage_data` 和 `rate_limit_reset_at` 显示进度条。**无后台定时 poller**（Phase 1.5 已移除 `USAGE_POLL_INTERVAL_SECS`）。
 
+### 历史用量统计
+
+中转站会观察实际发往 `/v1/messages` 的上游响应，记录 input、output、cache read、5 分钟 cache creation、1 小时 cache creation token，并在入库时使用固定版本价格计算 nano-USD。未知模型或部分缺价仍保留 token，管理页显示“已知成本 + 未定价”，不会把它当成完整 `$0`。统计事件不保存 prompt、response、请求正文或任何凭证。
+
+历史用量与上面的账号 `usage_data` 配额窗口快照完全分离。事件时间以 UTC 保存，所有日、周、月边界固定按 `Asia/Singapore`（UTC+8），周一开周；请求级事件最多保留 365 个新加坡自然日。`GET /admin/usage` 支持 `start_date`、`end_date`、`granularity`、`account_id`、`api_token_id`、`model` 和 `group_by`。
+
+默认 SQLite 由单后台 writer 批量写入并启用 WAL。代表性容量约为 280 bytes / 事件：1,000 请求/日约 98 MiB/年，10,000 请求/日约 0.95 GiB/年，100,000 请求/日约 9.5 GiB/年。在线清理会让空闲页供后续复用，但数据库文件通常不会自动缩小；需要缩文件时应在维护窗口手工执行 `VACUUM`。持续高写入、数 GB 数据或查询延迟不满足要求时，应改用 PostgreSQL 或按实测增加汇总层。
+
+价格覆盖示例：
+
+```env
+USAGE_PRICING_OVERRIDES_JSON={"custom-model":{"input_usd_per_million":"3","output_usd_per_million":"15","cache_creation_5m_usd_per_million":"3.75","cache_creation_1h_usd_per_million":"6","cache_read_usd_per_million":"0.3"}}
+```
+
 ### 请求头改写
 
 - User-Agent → `claude-code/<version> (external, cli)`
@@ -730,6 +747,10 @@ cc-bridge/
 | `token` | 自动生成的 `sk-...` 令牌 |
 | `allowed_accounts` / `blocked_accounts` | 账号 ID 列表（逗号分隔） |
 | `status` | `active` / `disabled` |
+
+### `usage_events` 表
+
+按上游请求保存 UTC/新加坡日、账号 ID、API Token ID、模型、五类 token、各组件 nano-USD 成本、价格版本、定价完整性和幂等键。账号或 Token 删除不会级联删除一年内的历史事件。
 
 > 服务启动时自动执行内建 SQL 迁移，不依赖外部 migration 文件。
 

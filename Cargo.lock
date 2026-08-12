@@ -328,9 +328,11 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.22.1",
+ "brotli",
  "bytes",
  "chrono",
  "dotenvy",
+ "flate2",
  "futures-core",
  "futures-util",
  "hex",
@@ -366,6 +368,7 @@ dependencies = [
  "webpki-roots 0.26.11",
  "x25519-dalek",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

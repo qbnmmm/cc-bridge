@@ -4,7 +4,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use rust_embed::Embed;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -14,11 +14,13 @@ use crate::error::AppError;
 use crate::middleware::auth::{admin_auth, extract_key};
 use crate::model::account::{Account, AccountAuthType, AccountStatus};
 use crate::model::api_token::{self, ApiToken};
+use crate::model::usage::{UsageGranularity, UsageGroupBy, UsageReportQuery};
 use crate::service::account::AccountService;
 use crate::service::gateway::GatewayService;
 use crate::service::oauth::TokenTester;
 use crate::service::oauth_flow::OAuthFlowService;
 use crate::service::telemetry::TelemetryService;
+use crate::service::usage::UsageService;
 use crate::store::token_store::TokenStore;
 
 #[derive(Clone)]
@@ -29,6 +31,7 @@ pub struct AppState {
     pub token_store: Arc<TokenStore>,
     pub oauth_flow_svc: Arc<OAuthFlowService>,
     pub telemetry_svc: Arc<TelemetryService>,
+    pub usage_svc: Arc<UsageService>,
     pub admin_password: String,
 }
 
@@ -40,6 +43,7 @@ pub fn build_router(
     token_store: Arc<TokenStore>,
     oauth_flow_svc: Arc<OAuthFlowService>,
     telemetry_svc: Arc<TelemetryService>,
+    usage_svc: Arc<UsageService>,
 ) -> Router {
     let state = AppState {
         gateway_svc,
@@ -48,6 +52,7 @@ pub fn build_router(
         token_store,
         oauth_flow_svc,
         telemetry_svc,
+        usage_svc,
         admin_password: cfg.admin.password.clone(),
     };
 
@@ -57,7 +62,8 @@ pub fn build_router(
     let frontend_routes = Router::new()
         .route("/", get(spa_handler))
         .route("/login", get(spa_handler))
-        .route("/tokens", get(spa_handler));
+        .route("/tokens", get(spa_handler))
+        .route("/usage", get(spa_handler));
 
     // 前端静态资源
     let asset_routes = Router::new()
@@ -79,6 +85,8 @@ pub fn build_router(
             put(update_token).delete(delete_token_handler),
         )
         .route("/admin/dashboard", get(get_dashboard))
+        .route("/admin/usage", get(get_usage))
+        .route("/admin/usage/dimensions", get(get_usage_dimensions))
         .route(
             "/admin/oauth/generate-auth-url",
             post(oauth_generate_auth_url),
@@ -124,6 +132,120 @@ async fn gateway_fallback(State(state): State<AppState>, req: Request) -> Respon
         .gateway_svc
         .handle_request(req, Some(&api_token))
         .await
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageQuery {
+    granularity: Option<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    account_id: Option<i64>,
+    api_token_id: Option<i64>,
+    model: Option<String>,
+    group_by: Option<String>,
+}
+
+async fn get_usage(
+    State(state): State<AppState>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let report = state.usage_svc.report(validate_usage_query(query)?).await?;
+    let mut value = serde_json::to_value(report)
+        .map_err(|error| AppError::Internal(format!("serialize usage report: {error}")))?;
+    value["ingestion"] = serde_json::to_value(state.usage_svc.health())
+        .map_err(|error| AppError::Internal(format!("serialize usage health: {error}")))?;
+    Ok(Json(value))
+}
+
+async fn get_usage_dimensions(
+    State(state): State<AppState>,
+) -> Result<Json<crate::store::usage_store::UsageDimensions>, AppError> {
+    let min_sg_day = crate::service::usage::sg_day_from_date(singapore_today()) - 364;
+    Ok(Json(state.usage_svc.dimensions(min_sg_day).await?))
+}
+
+fn validate_usage_query(query: UsageQuery) -> Result<UsageReportQuery, AppError> {
+    let today = singapore_today();
+    let min_date = today - ChronoDuration::days(364);
+    let end_date = query
+        .end_date
+        .as_deref()
+        .map(parse_usage_date)
+        .transpose()?
+        .unwrap_or(today);
+    let start_date = query
+        .start_date
+        .as_deref()
+        .map(parse_usage_date)
+        .transpose()?
+        .unwrap_or_else(|| end_date - ChronoDuration::days(29));
+    if start_date > end_date {
+        return Err(AppError::BadRequest(
+            "start_date must not be after end_date".into(),
+        ));
+    }
+    if end_date > today {
+        return Err(AppError::BadRequest(
+            "end_date must not be in the future (Asia/Singapore)".into(),
+        ));
+    }
+    if start_date < min_date {
+        return Err(AppError::BadRequest(
+            "start_date is outside the 365-day retention window".into(),
+        ));
+    }
+    if end_date.signed_duration_since(start_date).num_days() >= 365 {
+        return Err(AppError::BadRequest(
+            "usage date range must be at most 365 days".into(),
+        ));
+    }
+    if query.account_id.is_some_and(|id| id <= 0) || query.api_token_id.is_some_and(|id| id <= 0) {
+        return Err(AppError::BadRequest(
+            "account_id and api_token_id must be positive".into(),
+        ));
+    }
+    let model = query
+        .model
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty());
+    let granularity = match query.granularity.as_deref().unwrap_or("day") {
+        "day" => UsageGranularity::Day,
+        "week" => UsageGranularity::Week,
+        "month" => UsageGranularity::Month,
+        _ => {
+            return Err(AppError::BadRequest(
+                "granularity must be day, week, or month".into(),
+            ));
+        }
+    };
+    let group_by = match query.group_by.as_deref().unwrap_or("model") {
+        "account" => UsageGroupBy::Account,
+        "api_token" => UsageGroupBy::ApiToken,
+        "model" => UsageGroupBy::Model,
+        _ => {
+            return Err(AppError::BadRequest(
+                "group_by must be account, api_token, or model".into(),
+            ));
+        }
+    };
+    Ok(UsageReportQuery {
+        start_date,
+        end_date,
+        granularity,
+        account_id: query.account_id,
+        api_token_id: query.api_token_id,
+        model,
+        group_by,
+    })
+}
+
+fn parse_usage_date(value: &str) -> Result<NaiveDate, AppError> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest(format!("invalid date: {value}; expected YYYY-MM-DD")))
+}
+
+fn singapore_today() -> NaiveDate {
+    (Utc::now() + ChronoDuration::hours(8)).date_naive()
 }
 
 /// 统一 JSON 错误响应
@@ -748,5 +870,48 @@ mod tests {
             );
             assert!(matches!(result, Err(AppError::BadRequest(_))));
         }
+    }
+
+    #[test]
+    fn usage_query_defaults_to_last_thirty_singapore_days() {
+        let query = validate_usage_query(UsageQuery {
+            granularity: None,
+            start_date: None,
+            end_date: None,
+            account_id: None,
+            api_token_id: None,
+            model: None,
+            group_by: None,
+        })
+        .unwrap();
+        assert_eq!(query.end_date, singapore_today());
+        assert_eq!(
+            query
+                .end_date
+                .signed_duration_since(query.start_date)
+                .num_days(),
+            29
+        );
+        assert_eq!(query.granularity, UsageGranularity::Day);
+        assert_eq!(query.group_by, UsageGroupBy::Model);
+    }
+
+    #[test]
+    fn usage_query_rejects_invalid_range_and_enums() {
+        let today = singapore_today();
+        let tomorrow = today + ChronoDuration::days(1);
+        let invalid = UsageQuery {
+            granularity: Some("year".into()),
+            start_date: Some(today.to_string()),
+            end_date: Some(tomorrow.to_string()),
+            account_id: Some(0),
+            api_token_id: None,
+            model: None,
+            group_by: Some("status".into()),
+        };
+        assert!(matches!(
+            validate_usage_query(invalid),
+            Err(AppError::BadRequest(_))
+        ));
     }
 }

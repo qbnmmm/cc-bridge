@@ -71,6 +71,15 @@ async fn main() {
         pool.clone(),
         driver.clone(),
     ));
+    let usage_store = Arc::new(store::usage_store::UsageStore::new(
+        pool.clone(),
+        driver.clone(),
+    ));
+    let pricing = service::usage_pricing::PricingEngine::from_override_json(
+        cfg.usage_pricing_overrides_json.as_deref(),
+    )
+    .expect("invalid usage pricing configuration");
+    let usage_svc = service::usage::UsageService::start(usage_store, pricing);
 
     // 一次性清理：Phase 1 之前旧限流路径写入的残留字段（status='active' 账号上的
     // rate_limited_at / rate_limit_reset_at / disable_reason）。幂等，每次启动执行。
@@ -96,6 +105,7 @@ async fn main() {
         rewriter.clone(),
         telemetry_svc.clone(),
         limit_store.clone(),
+        usage_svc.clone(),
     ));
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
@@ -108,6 +118,7 @@ async fn main() {
         token_store,
         oauth_flow_svc,
         telemetry_svc,
+        usage_svc,
     );
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);

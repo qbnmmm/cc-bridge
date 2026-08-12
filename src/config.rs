@@ -8,6 +8,7 @@ pub struct Config {
     pub redis: Option<RedisConfig>,
     pub admin: AdminConfig,
     pub log_level: String,
+    pub usage_pricing_overrides_json: Option<String>,
 }
 
 #[derive(Clone)]
@@ -126,6 +127,8 @@ impl Config {
                 password: env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "admin".into()),
             },
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
+            usage_pricing_overrides_json: env_var("USAGE_PRICING_OVERRIDES_JSON")
+                .filter(|value| !value.trim().is_empty()),
         }
     }
 }

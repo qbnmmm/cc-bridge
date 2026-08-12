@@ -32,8 +32,8 @@ onMounted(loadDashboard);
   <div class="min-h-screen">
     <!-- 顶部导航栏 -->
     <header class="sticky top-0 z-40 bg-white/80 backdrop-blur-md border-b border-[#e8e2d9]/60 px-6 py-3">
-      <div class="max-w-7xl mx-auto flex items-center justify-between">
-        <div class="flex items-center gap-6">
+      <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+        <div class="flex flex-wrap items-center gap-3 sm:gap-6">
           <div class="flex items-center gap-2">
             <img src="/favicon.svg" alt="Logo" class="w-6 h-6" />
             <h1 class="text-lg font-semibold text-[#29261e] tracking-tight">cc-bridge</h1>
@@ -56,6 +56,15 @@ onMounted(loadDashboard);
                 : 'text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]'"
             >
               令牌
+            </router-link>
+            <router-link
+              :to="{ name: 'usage' }"
+              class="px-3 py-1.5 text-sm rounded-lg transition-colors"
+              :class="route.name === 'usage'
+                ? 'bg-[#c4704f]/10 text-[#c4704f] font-medium'
+                : 'text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]'"
+            >
+              用量
             </router-link>
           </nav>
         </div>

@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
@@ -83,6 +83,19 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         PG_TOKENS_SCHEMA
     };
     for stmt in token_schema.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        sqlx::query(stmt).execute(pool).await?;
+    }
+
+    let usage_schema = if driver == "sqlite" {
+        SQLITE_USAGE_SCHEMA
+    } else {
+        PG_USAGE_SCHEMA
+    };
+    for stmt in usage_schema.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
             continue;
@@ -207,8 +220,7 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         SCHEMA_VERSION
     ))
     .execute(pool)
-    .await
-    .ok();
+    .await?;
 
     Ok(())
 }
@@ -347,6 +359,76 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
+"#;
+
+const SQLITE_USAGE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedup_key                           TEXT NOT NULL UNIQUE,
+    upstream_message_id                 TEXT,
+    upstream_request_id                 TEXT,
+    occurred_at_utc                     TEXT NOT NULL,
+    sg_day                              INTEGER NOT NULL,
+    account_id                          INTEGER NOT NULL,
+    api_token_id                        INTEGER NOT NULL,
+    model                               TEXT NOT NULL,
+    input_tokens                        INTEGER NOT NULL CHECK (input_tokens >= 0),
+    output_tokens                       INTEGER NOT NULL CHECK (output_tokens >= 0),
+    cache_creation_5m_tokens            INTEGER NOT NULL CHECK (cache_creation_5m_tokens >= 0),
+    cache_creation_1h_tokens            INTEGER NOT NULL CHECK (cache_creation_1h_tokens >= 0),
+    cache_read_tokens                   INTEGER NOT NULL CHECK (cache_read_tokens >= 0),
+    input_cost_nano_usd                 INTEGER CHECK (input_cost_nano_usd >= 0),
+    output_cost_nano_usd                INTEGER CHECK (output_cost_nano_usd >= 0),
+    cache_creation_5m_cost_nano_usd     INTEGER CHECK (cache_creation_5m_cost_nano_usd >= 0),
+    cache_creation_1h_cost_nano_usd     INTEGER CHECK (cache_creation_1h_cost_nano_usd >= 0),
+    cache_read_cost_nano_usd            INTEGER CHECK (cache_read_cost_nano_usd >= 0),
+    known_cost_nano_usd                 INTEGER NOT NULL CHECK (known_cost_nano_usd >= 0),
+    cost_complete                       INTEGER NOT NULL CHECK (cost_complete IN (0, 1)),
+    pricing_version                     TEXT NOT NULL,
+    pricing_model_key                   TEXT,
+    http_status                         INTEGER NOT NULL CHECK (http_status BETWEEN 100 AND 599),
+    is_stream                           INTEGER NOT NULL CHECK (is_stream IN (0, 1)),
+    created_at_utc                      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_sg_day ON usage_events(sg_day, id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_account_day ON usage_events(account_id, sg_day);
+CREATE INDEX IF NOT EXISTS idx_usage_events_api_token_day ON usage_events(api_token_id, sg_day);
+CREATE INDEX IF NOT EXISTS idx_usage_events_model_day ON usage_events(model, sg_day)
+"#;
+
+const PG_USAGE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                                  BIGSERIAL PRIMARY KEY,
+    dedup_key                           TEXT NOT NULL UNIQUE,
+    upstream_message_id                 TEXT,
+    upstream_request_id                 TEXT,
+    occurred_at_utc                     TIMESTAMPTZ NOT NULL,
+    sg_day                              INTEGER NOT NULL,
+    account_id                          BIGINT NOT NULL,
+    api_token_id                        BIGINT NOT NULL,
+    model                               TEXT NOT NULL,
+    input_tokens                        BIGINT NOT NULL CHECK (input_tokens >= 0),
+    output_tokens                       BIGINT NOT NULL CHECK (output_tokens >= 0),
+    cache_creation_5m_tokens            BIGINT NOT NULL CHECK (cache_creation_5m_tokens >= 0),
+    cache_creation_1h_tokens            BIGINT NOT NULL CHECK (cache_creation_1h_tokens >= 0),
+    cache_read_tokens                   BIGINT NOT NULL CHECK (cache_read_tokens >= 0),
+    input_cost_nano_usd                 BIGINT CHECK (input_cost_nano_usd >= 0),
+    output_cost_nano_usd                BIGINT CHECK (output_cost_nano_usd >= 0),
+    cache_creation_5m_cost_nano_usd     BIGINT CHECK (cache_creation_5m_cost_nano_usd >= 0),
+    cache_creation_1h_cost_nano_usd     BIGINT CHECK (cache_creation_1h_cost_nano_usd >= 0),
+    cache_read_cost_nano_usd            BIGINT CHECK (cache_read_cost_nano_usd >= 0),
+    known_cost_nano_usd                 BIGINT NOT NULL CHECK (known_cost_nano_usd >= 0),
+    cost_complete                       INTEGER NOT NULL CHECK (cost_complete IN (0, 1)),
+    pricing_version                     TEXT NOT NULL,
+    pricing_model_key                   TEXT,
+    http_status                         INTEGER NOT NULL CHECK (http_status BETWEEN 100 AND 599),
+    is_stream                           INTEGER NOT NULL CHECK (is_stream IN (0, 1)),
+    created_at_utc                      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_sg_day ON usage_events(sg_day, id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_account_day ON usage_events(account_id, sg_day);
+CREATE INDEX IF NOT EXISTS idx_usage_events_api_token_day ON usage_events(api_token_id, sg_day);
+CREATE INDEX IF NOT EXISTS idx_usage_events_model_day ON usage_events(model, sg_day)
 "#;
 
 fn start_compose_postgres() -> Result<(), String> {

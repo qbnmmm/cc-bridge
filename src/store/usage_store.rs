@@ -3,8 +3,8 @@ use sqlx::{Any, AnyPool, QueryBuilder, Row};
 
 use crate::error::AppError;
 use crate::model::usage::{
-    DailyUsageRow, UsageDimensionOption, UsageEvent, UsageFilters, UsageGroupBy, UsageMetrics,
-    UsageTokens,
+    DailyUsageRow, UnpricedUsageEvent, UsageDimensionOption, UsageEvent, UsageFilters,
+    UsageGroupBy, UsageMetrics, UsagePricingUpdate, UsageTokens,
 };
 
 pub struct UsageStore {
@@ -84,21 +84,21 @@ impl UsageStore {
         };
         let mut qb = QueryBuilder::<Any>::new(format!(
             r#"SELECT sg_day, {group_id} AS group_id, {group_text} AS group_text,
-                COUNT(*) AS request_count,
-                CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens,
-                CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens,
-                CAST(COALESCE(SUM(cache_creation_5m_tokens), 0) AS BIGINT) AS cache_creation_5m_tokens,
-                CAST(COALESCE(SUM(cache_creation_1h_tokens), 0) AS BIGINT) AS cache_creation_1h_tokens,
-                CAST(COALESCE(SUM(cache_read_tokens), 0) AS BIGINT) AS cache_read_tokens,
-                CAST(COALESCE(SUM(known_cost_nano_usd), 0) AS BIGINT) AS known_cost_nano_usd,
-                CAST(COALESCE(SUM(CASE WHEN cost_complete = 0 THEN 1 ELSE 0 END), 0) AS BIGINT) AS unpriced_request_count,
+                CAST(COUNT(*) AS TEXT) AS request_count,
+                CAST(COALESCE(SUM(input_tokens), 0) AS TEXT) AS input_tokens,
+                CAST(COALESCE(SUM(output_tokens), 0) AS TEXT) AS output_tokens,
+                CAST(COALESCE(SUM(cache_creation_5m_tokens), 0) AS TEXT) AS cache_creation_5m_tokens,
+                CAST(COALESCE(SUM(cache_creation_1h_tokens), 0) AS TEXT) AS cache_creation_1h_tokens,
+                CAST(COALESCE(SUM(cache_read_tokens), 0) AS TEXT) AS cache_read_tokens,
+                CAST(COALESCE(SUM(known_cost_nano_usd), 0) AS TEXT) AS known_cost_nano_usd,
+                CAST(COALESCE(SUM(CASE WHEN cost_complete = 0 THEN 1 ELSE 0 END), 0) AS TEXT) AS unpriced_request_count,
                 CAST(COALESCE(SUM(
                     CASE WHEN input_cost_nano_usd IS NULL THEN input_tokens ELSE 0 END +
                     CASE WHEN output_cost_nano_usd IS NULL THEN output_tokens ELSE 0 END +
                     CASE WHEN cache_creation_5m_cost_nano_usd IS NULL THEN cache_creation_5m_tokens ELSE 0 END +
                     CASE WHEN cache_creation_1h_cost_nano_usd IS NULL THEN cache_creation_1h_tokens ELSE 0 END +
                     CASE WHEN cache_read_cost_nano_usd IS NULL THEN cache_read_tokens ELSE 0 END
-                ), 0) AS BIGINT) AS unpriced_tokens
+                ), 0) AS TEXT) AS unpriced_tokens
               FROM usage_events WHERE sg_day >= "#,
         ));
         qb.push_bind(filters.start_sg_day)
@@ -178,6 +178,126 @@ impl UsageStore {
         Ok(result.rows_affected())
     }
 
+    pub async fn load_pricing_snapshot(&self) -> Result<Option<String>, AppError> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT snapshot_json FROM usage_pricing_cache WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn save_pricing_snapshot(
+        &self,
+        snapshot_json: &str,
+        pricing_version: &str,
+        fetched_at_utc: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), AppError> {
+        let fetched_at = fetched_at_utc.to_rfc3339();
+        let fetched_at_bind = if self.driver == "postgres" {
+            "$4::TEXT::TIMESTAMPTZ"
+        } else {
+            "$4"
+        };
+        let statement = format!(
+            "INSERT INTO usage_pricing_cache (id, snapshot_json, pricing_version, fetched_at_utc) \
+             VALUES ($1, $2, $3, {fetched_at_bind}) \
+             ON CONFLICT (id) DO UPDATE SET snapshot_json = EXCLUDED.snapshot_json, \
+             pricing_version = EXCLUDED.pricing_version, fetched_at_utc = EXCLUDED.fetched_at_utc"
+        );
+        sqlx::query(&statement)
+            .bind(1_i32)
+            .bind(snapshot_json)
+            .bind(pricing_version)
+            .bind(fetched_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn unpriced_events_after(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<UnpricedUsageEvent>, AppError> {
+        let rows = sqlx::query(
+            r#"SELECT id, model, input_tokens, output_tokens,
+                      cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens
+               FROM usage_events
+               WHERE cost_complete = 0 AND id > $1
+               ORDER BY id LIMIT $2"#,
+        )
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(UnpricedUsageEvent {
+                    id: row.try_get("id")?,
+                    model: row.try_get("model")?,
+                    tokens: UsageTokens {
+                        input: row.try_get("input_tokens")?,
+                        output: row.try_get("output_tokens")?,
+                        cache_creation_5m: row.try_get("cache_creation_5m_tokens")?,
+                        cache_creation_1h: row.try_get("cache_creation_1h_tokens")?,
+                        cache_read: row.try_get("cache_read_tokens")?,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(AppError::from)
+    }
+
+    pub async fn apply_pricing_updates(
+        &self,
+        updates: &[UsagePricingUpdate],
+    ) -> Result<u64, AppError> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut updated = 0_u64;
+        let nullable = if self.driver == "postgres" {
+            [
+                "$2::BIGINT",
+                "$3::BIGINT",
+                "$4::BIGINT",
+                "$5::BIGINT",
+                "$6::BIGINT",
+            ]
+        } else {
+            ["$2", "$3", "$4", "$5", "$6"]
+        };
+        let statement = format!(
+            r#"UPDATE usage_events SET
+                   input_cost_nano_usd = {}, output_cost_nano_usd = {},
+                   cache_creation_5m_cost_nano_usd = {},
+                   cache_creation_1h_cost_nano_usd = {}, cache_read_cost_nano_usd = {},
+                   known_cost_nano_usd = $7, cost_complete = $8,
+                   pricing_version = $9, pricing_model_key = $10
+               WHERE id = $1 AND cost_complete = 0"#,
+            nullable[0], nullable[1], nullable[2], nullable[3], nullable[4]
+        );
+        for update in updates {
+            let result = sqlx::query(&statement)
+                .bind(update.id)
+                .bind(update.costs.input_nano_usd)
+                .bind(update.costs.output_nano_usd)
+                .bind(update.costs.cache_creation_5m_nano_usd)
+                .bind(update.costs.cache_creation_1h_nano_usd)
+                .bind(update.costs.cache_read_nano_usd)
+                .bind(update.costs.known_nano_usd)
+                .bind(i32::from(update.costs.complete))
+                .bind(&update.pricing_version)
+                .bind(&update.pricing_model_key)
+                .execute(&mut *tx)
+                .await?;
+            updated += result.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     pub fn driver(&self) -> &str {
         &self.driver
     }
@@ -226,26 +346,32 @@ impl UsageStore {
 }
 
 fn row_to_daily(row: &AnyRow) -> Result<DailyUsageRow, sqlx::Error> {
-    let unpriced_request_count = row.try_get::<i64, _>("unpriced_request_count")?;
+    let unpriced_request_count = row_i64_text(row, "unpriced_request_count")?;
     Ok(DailyUsageRow {
         sg_day: row.try_get("sg_day")?,
         group_id: row.try_get("group_id")?,
         group_text: row.try_get("group_text")?,
         metrics: UsageMetrics {
-            request_count: row.try_get("request_count")?,
+            request_count: row_i64_text(row, "request_count")?,
             tokens: UsageTokens {
-                input: row.try_get("input_tokens")?,
-                output: row.try_get("output_tokens")?,
-                cache_creation_5m: row.try_get("cache_creation_5m_tokens")?,
-                cache_creation_1h: row.try_get("cache_creation_1h_tokens")?,
-                cache_read: row.try_get("cache_read_tokens")?,
+                input: row_i64_text(row, "input_tokens")?,
+                output: row_i64_text(row, "output_tokens")?,
+                cache_creation_5m: row_i64_text(row, "cache_creation_5m_tokens")?,
+                cache_creation_1h: row_i64_text(row, "cache_creation_1h_tokens")?,
+                cache_read: row_i64_text(row, "cache_read_tokens")?,
             },
-            known_cost_nano_usd: row.try_get("known_cost_nano_usd")?,
+            known_cost_nano_usd: row_i64_text(row, "known_cost_nano_usd")?,
             cost_complete: unpriced_request_count == 0,
             unpriced_request_count,
-            unpriced_tokens: row.try_get("unpriced_tokens")?,
+            unpriced_tokens: row_i64_text(row, "unpriced_tokens")?,
         },
     })
+}
+
+fn row_i64_text(row: &AnyRow, column: &str) -> Result<i64, sqlx::Error> {
+    row.try_get::<String, _>(column)?
+        .parse::<i64>()
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))
 }
 
 fn row_to_dimension(row: &AnyRow) -> Result<UsageDimensionOption, sqlx::Error> {
@@ -319,7 +445,7 @@ mod tests {
     async fn sqlite_contract_covers_migration_dedup_aggregate_dimensions_and_retention() {
         let (store, path) = sqlite_store().await;
         let version: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 2")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 3")
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();
@@ -380,6 +506,59 @@ mod tests {
         assert_eq!(unpriced[0].metrics.unpriced_request_count, 1);
         assert_eq!(unpriced[0].metrics.unpriced_tokens, 2);
         assert!(!unpriced[0].metrics.cost_complete);
+
+        store
+            .save_pricing_snapshot(
+                r#"{"version":"remote-v1","rules":{"unknown-model":{"model_key":"unknown-model","input":1000000000,"output":2000000000,"cache_creation_5m":3000000000,"cache_creation_1h":4000000000,"cache_read":5000000000,"long_context":null}}}"#,
+                "remote-v1",
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .load_pricing_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("remote-v1")
+        );
+
+        let unpriced_events = store.unpriced_events_after(0, 10).await.unwrap();
+        assert_eq!(unpriced_events.len(), 1);
+        let unpriced_id = unpriced_events[0].id;
+        let costs = UsageCosts {
+            input_nano_usd: Some(10),
+            output_nano_usd: Some(20),
+            cache_creation_5m_nano_usd: Some(30),
+            cache_creation_1h_nano_usd: Some(40),
+            cache_read_nano_usd: Some(50),
+            known_nano_usd: i64::from(i32::MAX) + 10,
+            complete: true,
+            unpriced_tokens: 0,
+        };
+        let update = UsagePricingUpdate {
+            id: unpriced_id,
+            costs: costs.clone(),
+            pricing_version: "remote-v1".into(),
+            pricing_model_key: "unknown-model".into(),
+        };
+        assert_eq!(
+            store
+                .apply_pricing_updates(&[update.clone()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.apply_pricing_updates(&[update]).await.unwrap(), 0);
+        let stored_cost: String = sqlx::query_scalar(
+            "SELECT CAST(known_cost_nano_usd AS TEXT) FROM usage_events WHERE id = $1",
+        )
+        .bind(unpriced_id)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_cost.parse::<i64>().unwrap(), costs.known_nano_usd);
 
         let dimensions = store.dimensions(100).await.unwrap();
         assert!(

@@ -220,7 +220,7 @@ curl http://127.0.0.1:5674/v1/messages \
 | `DATABASE_USER` | `POSTGRES_USER` 或 `postgres` | PostgreSQL 用户名 |
 | `DATABASE_PASSWORD` | `POSTGRES_PASSWORD` 或空 | PostgreSQL 密码 |
 | `DATABASE_DBNAME` | `POSTGRES_DB` 或 `claude_code_gateway` | PostgreSQL 数据库名 |
-| `USAGE_PRICING_OVERRIDES_JSON` | - | 可选的 exact-model 历史用量价格覆盖，费率使用十进制字符串，单位 USD / 百万 token；无效配置会阻止启动 |
+| `USAGE_PRICING_OVERRIDES_JSON` | - | 可选的 exact-model 用量价格覆盖，优先于自动价格；费率使用十进制字符串，单位 USD / 百万 token；无效配置会阻止启动 |
 
 > SQLite 自动创建目录并启用 WAL 模式。PostgreSQL 在未提供 `DATABASE_DSN` 时，会先拉起根目录 `docker-compose.yml` 里的 `postgres` 服务，然后自动创建 `DATABASE_DBNAME` 指定的数据库。
 
@@ -675,7 +675,11 @@ cc-bridge/
 
 ### 历史用量统计
 
-中转站会观察实际发往 `/v1/messages` 的上游响应，记录 input、output、cache read、5 分钟 cache creation、1 小时 cache creation token，并在入库时使用固定版本价格计算 nano-USD。未知模型或部分缺价仍保留 token，管理页显示“已知成本 + 未定价”，不会把它当成完整 `$0`。统计事件不保存 prompt、response、请求正文或任何凭证。
+中转站会观察实际发往 `/v1/messages` 的上游响应，记录 input、output、cache read、5 分钟 cache creation、1 小时 cache creation token，并在入库时使用版本化价格计算 nano-USD。未知模型或部分缺价仍保留 token，管理页显示“已知成本 + 未定价”，不会把它当成完整 `$0`。统计事件不保存 prompt、response、请求正文或任何凭证。
+
+价格机制参考 ccusage：程序内置一份 Anthropic 价格作为离线兜底，启动后立即在后台从 LiteLLM 和 models.dev 刷新，此后每 24 小时刷新一次。最近一次成功快照保存在数据库中并在下次启动优先加载；网络或来源异常不会阻止服务启动，也不会影响模型请求。LiteLLM 的 Anthropic 价格优先，models.dev 只补缺失模型，`USAGE_PRICING_OVERRIDES_JSON` 的 exact-model 配置优先级最高。
+
+新价格用于后续事件，并会分批补齐仍标记为“未定价”的历史事件；已经完整定价的历史事件不会重算。价格缓存只占数据库一行，未定价回填使用局部索引，因此对 SQLite 的额外空间影响可以忽略。
 
 历史用量与上面的账号 `usage_data` 配额窗口快照完全分离。事件时间以 UTC 保存，所有日、周、月边界固定按 `Asia/Singapore`（UTC+8），周一开周；请求级事件最多保留 365 个新加坡自然日。`GET /admin/usage` 支持 `start_date`、`end_date`、`granularity`、`account_id`、`api_token_id`、`model` 和 `group_by`。
 

@@ -79,7 +79,7 @@ async fn main() {
         cfg.usage_pricing_overrides_json.as_deref(),
     )
     .expect("invalid usage pricing configuration");
-    let usage_svc = service::usage::UsageService::start(usage_store, pricing);
+    let usage_svc = service::usage::UsageService::start(usage_store, pricing).await;
 
     // 一次性清理：Phase 1 之前旧限流路径写入的残留字段（status='active' 账号上的
     // rate_limited_at / rate_limit_reset_at / disable_reason）。幂等，每次启动执行。

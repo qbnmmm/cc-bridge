@@ -83,6 +83,21 @@ pub struct UsageEvent {
     pub is_stream: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpricedUsageEvent {
+    pub id: i64,
+    pub model: String,
+    pub tokens: UsageTokens,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsagePricingUpdate {
+    pub id: i64,
+    pub costs: UsageCosts,
+    pub pricing_version: String,
+    pub pricing_model_key: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UsageMetrics {
     pub request_count: i64,

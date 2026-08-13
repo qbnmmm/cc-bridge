@@ -333,6 +333,19 @@ pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
     make_request_client_with_read_timeout(proxy_url, UPSTREAM_READ_TIMEOUT)
 }
 
+/// 创建带 TLS 指纹和显式连接/读取超时的直连客户端。
+pub fn make_request_client_with_timeouts(
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .use_preconfigured_tls(build_tls_config())
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .no_proxy()
+        .build()
+}
+
 /// 内部构造函数：暴露 read_timeout 参数给测试用短值验证 idle 语义。
 fn make_request_client_with_read_timeout(
     proxy_url: &str,

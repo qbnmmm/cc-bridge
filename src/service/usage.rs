@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -12,14 +12,17 @@ use futures_core::Stream;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::AppError;
 use crate::model::usage::{
     DailyUsageRow, UsageBreakdownRow, UsageBucket, UsageDateRange, UsageEvent, UsageFilters,
-    UsageGranularity, UsageGroupBy, UsageMetrics, UsageReport, UsageReportQuery, UsageTokens,
+    UsageGranularity, UsageGroupBy, UsageMetrics, UsagePricingUpdate, UsageReport,
+    UsageReportQuery, UsageTokens,
 };
-use crate::service::usage_pricing::PricingEngine;
+use crate::service::usage_pricing::{
+    PricingEngine, PricingSnapshot, fetch_remote_pricing_snapshot,
+};
 use crate::store::usage_store::UsageStore;
 
 const QUEUE_CAPACITY: usize = 4096;
@@ -28,6 +31,8 @@ const WRITE_BATCH_DELAY: Duration = Duration::from_millis(200);
 const JSON_LIMIT: usize = 16 * 1024 * 1024;
 const SSE_LINE_LIMIT: usize = 256 * 1024;
 const RETENTION_BATCH_SIZE: i64 = 5_000;
+const PRICING_BACKFILL_BATCH_SIZE: i64 = 250;
+const PRICING_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const DECODE_BUFFER_SIZE: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,25 +142,58 @@ struct UsageHealthCounters {
 
 pub struct UsageService {
     store: Arc<UsageStore>,
-    pricing: Arc<PricingEngine>,
+    pricing: Arc<RwLock<PricingEngine>>,
     sender: mpsc::Sender<UsageEvent>,
     health: Arc<UsageHealthCounters>,
     since_utc: DateTime<Utc>,
 }
 
 impl UsageService {
-    pub fn start(store: Arc<UsageStore>, pricing: PricingEngine) -> Arc<Self> {
+    pub async fn start(store: Arc<UsageStore>, pricing: PricingEngine) -> Arc<Self> {
+        Self::start_inner(store, pricing, true).await
+    }
+
+    #[cfg(test)]
+    async fn start_without_pricing_refresh(
+        store: Arc<UsageStore>,
+        pricing: PricingEngine,
+    ) -> Arc<Self> {
+        Self::start_inner(store, pricing, false).await
+    }
+
+    async fn start_inner(
+        store: Arc<UsageStore>,
+        mut pricing: PricingEngine,
+        refresh_pricing: bool,
+    ) -> Arc<Self> {
+        match store.load_pricing_snapshot().await {
+            Ok(Some(json)) => match PricingSnapshot::from_json(&json)
+                .and_then(|snapshot| pricing.with_snapshot(&snapshot))
+            {
+                Ok(cached) => {
+                    info!("loaded cached usage pricing version {}", cached.version());
+                    pricing = cached;
+                }
+                Err(error) => warn!("cached usage pricing ignored: {}", error),
+            },
+            Ok(None) => {}
+            Err(error) => warn!("load cached usage pricing failed: {}", error),
+        }
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let health = Arc::new(UsageHealthCounters::default());
+        let pricing = Arc::new(RwLock::new(pricing));
         let service = Arc::new(Self {
             store: store.clone(),
-            pricing: Arc::new(pricing),
+            pricing: pricing.clone(),
             sender,
             health: health.clone(),
             since_utc: Utc::now(),
         });
-        tokio::spawn(run_writer(store.clone(), receiver, health));
-        tokio::spawn(run_retention(store));
+        tokio::spawn(run_writer(store.clone(), pricing.clone(), receiver, health));
+        tokio::spawn(run_retention(store.clone()));
+        if refresh_pricing {
+            tokio::spawn(run_pricing_refresh(store, pricing));
+        }
         service
     }
 
@@ -293,7 +331,11 @@ impl UsageService {
             .model
             .filter(|model| !model.trim().is_empty())
             .unwrap_or(attempt.request_model);
-        let priced = self.pricing.price(&model, &parsed.tokens);
+        let priced = self
+            .pricing
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .price(&model, &parsed.tokens);
         let dedup_key = if let Some(message_id) = parsed.message_id.as_deref() {
             format!("anthropic:message:{message_id}")
         } else if let Some(request_id) = attempt.upstream_request_id.as_deref() {
@@ -1136,6 +1178,7 @@ fn singapore_midnight_utc(date: NaiveDate) -> DateTime<Utc> {
 
 async fn run_writer(
     store: Arc<UsageStore>,
+    pricing: Arc<RwLock<PricingEngine>>,
     mut receiver: mpsc::Receiver<UsageEvent>,
     health: Arc<UsageHealthCounters>,
 ) {
@@ -1147,6 +1190,21 @@ async fn run_writer(
             match tokio::time::timeout_at(deadline, receiver.recv()).await {
                 Ok(Some(event)) => batch.push(event),
                 Ok(None) | Err(_) => break,
+            }
+        }
+
+        let current_pricing = pricing
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for event in &mut batch {
+            if !event.costs.complete {
+                let priced = current_pricing.price(&event.model, &event.tokens);
+                if priced.costs.complete {
+                    event.costs = priced.costs;
+                    event.pricing_version = priced.pricing_version;
+                    event.pricing_model_key = priced.pricing_model_key;
+                }
             }
         }
 
@@ -1179,6 +1237,103 @@ async fn run_writer(
     }
 }
 
+async fn run_pricing_refresh(store: Arc<UsageStore>, pricing: Arc<RwLock<PricingEngine>>) {
+    let cached = pricing
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Err(error) = backfill_unpriced_usage(&store, &cached).await {
+        warn!(
+            "cached/builtin pricing historical backfill failed: {}",
+            error
+        );
+    }
+    loop {
+        match fetch_remote_pricing_snapshot().await {
+            Ok(snapshot) => {
+                let next = pricing
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .with_snapshot(&snapshot);
+                match next {
+                    Ok(next) => {
+                        let snapshot_json = snapshot.to_json();
+                        match snapshot_json {
+                            Ok(json) => {
+                                let version = next.version().to_string();
+                                *pricing
+                                    .write()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    next.clone();
+                                if let Err(error) = store
+                                    .save_pricing_snapshot(&json, snapshot.version(), Utc::now())
+                                    .await
+                                {
+                                    warn!("persist refreshed usage pricing failed: {}", error);
+                                }
+                                match backfill_unpriced_usage(&store, &next).await {
+                                    Ok(updated) => info!(
+                                        "usage pricing refreshed (version={}, backfilled={})",
+                                        version, updated
+                                    ),
+                                    Err(error) => warn!(
+                                        "usage pricing refreshed but historical backfill failed: {}",
+                                        error
+                                    ),
+                                }
+                            }
+                            Err(error) => {
+                                warn!("serialize refreshed usage pricing failed: {}", error)
+                            }
+                        }
+                    }
+                    Err(error) => warn!("refreshed usage pricing rejected: {}", error),
+                }
+            }
+            Err(error) => warn!(
+                "usage pricing refresh failed; keeping current cached/builtin pricing: {}",
+                error
+            ),
+        }
+        tokio::time::sleep(PRICING_REFRESH_INTERVAL).await;
+    }
+}
+
+async fn backfill_unpriced_usage(
+    store: &UsageStore,
+    pricing: &PricingEngine,
+) -> Result<u64, AppError> {
+    let mut after_id = 0_i64;
+    let mut updated_total = 0_u64;
+    loop {
+        let events = store
+            .unpriced_events_after(after_id, PRICING_BACKFILL_BATCH_SIZE)
+            .await?;
+        if events.is_empty() {
+            return Ok(updated_total);
+        }
+        after_id = events.last().map(|event| event.id).unwrap_or(after_id);
+        let updates = events
+            .into_iter()
+            .filter_map(|event| {
+                let priced = pricing.price(&event.model, &event.tokens);
+                (priced.costs.complete && priced.pricing_model_key.is_some()).then(|| {
+                    UsagePricingUpdate {
+                        id: event.id,
+                        costs: priced.costs,
+                        pricing_version: priced.pricing_version,
+                        pricing_model_key: priced
+                            .pricing_model_key
+                            .expect("checked pricing model key"),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        updated_total = updated_total.saturating_add(store.apply_pricing_updates(&updates).await?);
+        tokio::task::yield_now().await;
+    }
+}
+
 async fn run_retention(store: Arc<UsageStore>) {
     loop {
         let min_sg_day = sg_day_from_utc(Utc::now()) - 364;
@@ -1199,6 +1354,7 @@ async fn run_retention(store: Arc<UsageStore>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::usage::UsageCosts;
     use futures_util::StreamExt;
     use std::io::Write;
 
@@ -1567,6 +1723,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_backfill_prices_known_models_and_keeps_unknown_models() {
+        sqlx::any::install_default_drivers();
+        let path = std::env::temp_dir().join(format!(
+            "ccbridge_pricing_backfill_{}.db",
+            rand::random::<u64>()
+        ));
+        let pool = crate::store::db::init_db("sqlite", path.to_str().unwrap())
+            .await
+            .unwrap();
+        crate::store::db::migrate(&pool, "sqlite").await.unwrap();
+        let store = UsageStore::new(pool.clone(), "sqlite".into());
+        let tokens = UsageTokens {
+            input: 289,
+            output: 2_027,
+            cache_creation_5m: 6_099,
+            cache_creation_1h: 0,
+            cache_read: 4_272_647,
+        };
+        let unpriced = UsageCosts {
+            input_nano_usd: None,
+            output_nano_usd: None,
+            cache_creation_5m_nano_usd: None,
+            cache_creation_1h_nano_usd: Some(0),
+            cache_read_nano_usd: None,
+            known_nano_usd: 0,
+            complete: false,
+            unpriced_tokens: tokens.total(),
+        };
+        let event = |key: &str, model: &str| UsageEvent {
+            dedup_key: key.into(),
+            upstream_message_id: None,
+            upstream_request_id: None,
+            occurred_at_utc: Utc::now(),
+            sg_day: sg_day_from_utc(Utc::now()),
+            account_id: 1,
+            api_token_id: 1,
+            model: model.into(),
+            tokens: tokens.clone(),
+            costs: unpriced.clone(),
+            pricing_version: "old-missing".into(),
+            pricing_model_key: None,
+            http_status: 200,
+            is_stream: true,
+        };
+        store
+            .insert_batch(&[
+                event("known", "claude-opus-5"),
+                event("unknown", "still-unknown"),
+            ])
+            .await
+            .unwrap();
+
+        let updated =
+            backfill_unpriced_usage(&store, &PricingEngine::from_override_json(None).unwrap())
+                .await
+                .unwrap();
+        assert_eq!(updated, 1);
+        let known: (String, i32, Option<String>) = sqlx::query_as(
+            "SELECT CAST(known_cost_nano_usd AS TEXT), cost_complete, pricing_model_key \
+             FROM usage_events WHERE dedup_key = 'known'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(known.0.parse::<i64>().unwrap(), 2_226_562_250);
+        assert_eq!(known.1, 1);
+        assert_eq!(known.2.as_deref(), Some("claude-opus-5"));
+        let unknown: i32 = sqlx::query_scalar(
+            "SELECT cost_complete FROM usage_events WHERE dedup_key = 'unknown'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unknown, 0);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[tokio::test]
     async fn observed_stream_preserves_bytes_and_chunk_boundaries() {
         sqlx::any::install_default_drivers();
         let path =
@@ -1576,7 +1814,11 @@ mod tests {
             .unwrap();
         crate::store::db::migrate(&pool, "sqlite").await.unwrap();
         let store = Arc::new(UsageStore::new(pool.clone(), "sqlite".into()));
-        let service = UsageService::start(store, PricingEngine::from_override_json(None).unwrap());
+        let service = UsageService::start_without_pricing_refresh(
+            store,
+            PricingEngine::from_override_json(None).unwrap(),
+        )
+        .await;
         let chunks = vec![
             Bytes::from_static(b"{\"id\":\"msg_1\","),
             Bytes::from_static(b"\"model\":\"claude-sonnet-4-6\","),
@@ -1623,7 +1865,11 @@ mod tests {
             .unwrap();
         crate::store::db::migrate(&pool, "sqlite").await.unwrap();
         let store = Arc::new(UsageStore::new(pool.clone(), "sqlite".into()));
-        let service = UsageService::start(store, PricingEngine::from_override_json(None).unwrap());
+        let service = UsageService::start_without_pricing_refresh(
+            store,
+            PricingEngine::from_override_json(None).unwrap(),
+        )
+        .await;
         let encoded = gzip(JSON_USAGE_RESPONSE);
         let chunks: Vec<Bytes> = encoded.chunks(7).map(Bytes::copy_from_slice).collect();
         let stream =
@@ -1692,7 +1938,11 @@ mod tests {
             .unwrap();
         crate::store::db::migrate(&pool, "sqlite").await.unwrap();
         let store = Arc::new(UsageStore::new(pool.clone(), "sqlite".into()));
-        let service = UsageService::start(store, PricingEngine::from_override_json(None).unwrap());
+        let service = UsageService::start_without_pricing_refresh(
+            store,
+            PricingEngine::from_override_json(None).unwrap(),
+        )
+        .await;
         let sse = concat!(
             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_drop\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":11}}}\n\n",
             "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n"

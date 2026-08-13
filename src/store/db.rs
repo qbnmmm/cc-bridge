@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
@@ -106,7 +106,11 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
     // 增量迁移 — only ALTER columns that are actually missing, so remote-DB startups
     // don't pay ~20 round-trips for ALTERs that would otherwise fail with "column
     // already exists" and get swallowed by .ok().
-    let ts_type = if driver == "sqlite" { "TEXT" } else { "TIMESTAMPTZ" };
+    let ts_type = if driver == "sqlite" {
+        "TEXT"
+    } else {
+        "TIMESTAMPTZ"
+    };
     let json_type = if driver == "sqlite" { "TEXT" } else { "JSONB" };
     let cols = existing_columns(pool, driver, "accounts").await;
 
@@ -117,11 +121,17 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         ),
         (
             "usage_data",
-            format!("ALTER TABLE accounts ADD COLUMN usage_data {} NOT NULL DEFAULT '{{}}'", json_type),
+            format!(
+                "ALTER TABLE accounts ADD COLUMN usage_data {} NOT NULL DEFAULT '{{}}'",
+                json_type
+            ),
         ),
         (
             "usage_fetched_at",
-            format!("ALTER TABLE accounts ADD COLUMN usage_fetched_at {}", ts_type),
+            format!(
+                "ALTER TABLE accounts ADD COLUMN usage_fetched_at {}",
+                ts_type
+            ),
         ),
         (
             "auth_type",
@@ -137,11 +147,17 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
         ),
         (
             "oauth_expires_at",
-            format!("ALTER TABLE accounts ADD COLUMN oauth_expires_at {}", ts_type),
+            format!(
+                "ALTER TABLE accounts ADD COLUMN oauth_expires_at {}",
+                ts_type
+            ),
         ),
         (
             "oauth_refreshed_at",
-            format!("ALTER TABLE accounts ADD COLUMN oauth_refreshed_at {}", ts_type),
+            format!(
+                "ALTER TABLE accounts ADD COLUMN oauth_refreshed_at {}",
+                ts_type
+            ),
         ),
         (
             "auth_error",
@@ -189,10 +205,12 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
                 .unwrap_or(false)
         };
         if needs_type("usage_data", "jsonb") {
-            sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB")
-                .execute(pool)
-                .await
-                .ok();
+            sqlx::query(
+                "ALTER TABLE accounts ALTER COLUMN usage_data TYPE JSONB USING usage_data::JSONB",
+            )
+            .execute(pool)
+            .await
+            .ok();
         }
         if needs_type("usage_fetched_at", "timestamp with time zone") {
             sqlx::query("ALTER TABLE accounts ALTER COLUMN usage_fetched_at TYPE TIMESTAMPTZ USING usage_fetched_at::TIMESTAMPTZ")
@@ -393,7 +411,14 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS idx_usage_events_sg_day ON usage_events(sg_day, id);
 CREATE INDEX IF NOT EXISTS idx_usage_events_account_day ON usage_events(account_id, sg_day);
 CREATE INDEX IF NOT EXISTS idx_usage_events_api_token_day ON usage_events(api_token_id, sg_day);
-CREATE INDEX IF NOT EXISTS idx_usage_events_model_day ON usage_events(model, sg_day)
+CREATE INDEX IF NOT EXISTS idx_usage_events_model_day ON usage_events(model, sg_day);
+CREATE INDEX IF NOT EXISTS idx_usage_events_unpriced_id ON usage_events(id) WHERE cost_complete = 0;
+CREATE TABLE IF NOT EXISTS usage_pricing_cache (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    snapshot_json   TEXT NOT NULL,
+    pricing_version TEXT NOT NULL,
+    fetched_at_utc  TEXT NOT NULL
+)
 "#;
 
 const PG_USAGE_SCHEMA: &str = r#"
@@ -428,7 +453,14 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS idx_usage_events_sg_day ON usage_events(sg_day, id);
 CREATE INDEX IF NOT EXISTS idx_usage_events_account_day ON usage_events(account_id, sg_day);
 CREATE INDEX IF NOT EXISTS idx_usage_events_api_token_day ON usage_events(api_token_id, sg_day);
-CREATE INDEX IF NOT EXISTS idx_usage_events_model_day ON usage_events(model, sg_day)
+CREATE INDEX IF NOT EXISTS idx_usage_events_model_day ON usage_events(model, sg_day);
+CREATE INDEX IF NOT EXISTS idx_usage_events_unpriced_id ON usage_events(id) WHERE cost_complete = 0;
+CREATE TABLE IF NOT EXISTS usage_pricing_cache (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    snapshot_json   TEXT NOT NULL,
+    pricing_version TEXT NOT NULL,
+    fetched_at_utc  TIMESTAMPTZ NOT NULL
+)
 "#;
 
 fn start_compose_postgres() -> Result<(), String> {
@@ -505,4 +537,85 @@ async fn create_database_if_missing(cfg: &DatabaseConfig) -> Result<(), String> 
         .map_err(|err| format!("failed to create database {}: {err}", cfg.dbname))?;
     info!("created postgres database {}", cfg.dbname);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_migrates_existing_usage_v2_to_v3_without_losing_events() {
+        sqlx::any::install_default_drivers();
+        let path = std::env::temp_dir().join(format!(
+            "ccbridge_usage_v2_upgrade_{}.db",
+            rand::random::<u64>()
+        ));
+        let pool = init_db("sqlite", path.to_str().unwrap()).await.unwrap();
+        sqlx::query("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO schema_migrations (version) VALUES (2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for statement in SQLITE_USAGE_SCHEMA
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+        {
+            // Simulate the v2 deployment by excluding v3-only objects.
+            if statement.contains("usage_pricing_cache")
+                || statement.contains("idx_usage_events_unpriced_id")
+            {
+                continue;
+            }
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            r#"INSERT INTO usage_events (
+                dedup_key, occurred_at_utc, sg_day, account_id, api_token_id, model,
+                input_tokens, output_tokens, cache_creation_5m_tokens,
+                cache_creation_1h_tokens, cache_read_tokens,
+                known_cost_nano_usd, cost_complete, pricing_version, http_status, is_stream
+            ) VALUES ('existing', '2026-08-12T00:00:00Z', 1, 1, 1, 'unknown',
+                1, 0, 0, 0, 0, 0, 0, 'missing', 200, 0)"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate(&pool, "sqlite").await.unwrap();
+
+        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let version_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 3")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let cache_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'usage_pricing_cache'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let index_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_events_unpriced_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 1);
+        assert_eq!(version_count, 1);
+        assert_eq!(cache_exists, 1);
+        assert_eq!(index_exists, 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
 }

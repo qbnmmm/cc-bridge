@@ -14,10 +14,12 @@ const {
   loading,
   error,
   hasIngestionGap,
+  datePreset,
   loadReport,
   applyFilters,
   setGranularity,
   setGroupBy,
+  setDatePreset,
 } = useUsageReport()
 </script>
 
@@ -34,7 +36,9 @@ const {
       :filters="filters"
       :dimensions="dimensions"
       :loading="loading"
+      :date-preset="datePreset"
       @reload="loadReport"
+      @set-date-preset="setDatePreset"
       @set-granularity="setGranularity"
       @set-group-by="setGroupBy"
       @update-filters="applyFilters"

@@ -11,9 +11,12 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
 } from '@/components/ui/dialog';
 import { useToast } from '../composables/useToast';
+import { useAccountUsageCosts, type AccountCostPeriod } from '../composables/useAccountUsageCosts';
+import { formatNanoUsd } from '@/lib/usage';
 
 const emit = defineEmits<{ refresh: [] }>();
 const { show: toast } = useToast();
+const { accountCost, loadAccountUsageCosts } = useAccountUsageCosts();
 
 /** 账号列表 */
 const accounts = ref<Account[]>([]);
@@ -89,19 +92,28 @@ const visiblePages = computed(() => {
 
 /** 自动重载定时器 */
 let autoReloadTimer: ReturnType<typeof setInterval> | null = null;
+/** 账号成本每 5 分钟刷新一次，避免频繁扫描 30 日 ledger。 */
+let usageCostReloadTimer: ReturnType<typeof setInterval> | null = null;
 
 onMounted(() => {
-  load();
+  void Promise.all([load(), loadAccountUsageCosts()]);
   // 每 60 秒静默重拉账户列表（usage_data 会带新值过来）
   autoReloadTimer = setInterval(() => {
-    load();
+    void load();
   }, 60 * 1000);
+  usageCostReloadTimer = setInterval(() => {
+    void loadAccountUsageCosts();
+  }, 5 * 60 * 1000);
 });
 
 onUnmounted(() => {
   if (autoReloadTimer) {
     clearInterval(autoReloadTimer);
     autoReloadTimer = null;
+  }
+  if (usageCostReloadTimer) {
+    clearInterval(usageCostReloadTimer);
+    usageCostReloadTimer = null;
   }
 });
 
@@ -357,6 +369,23 @@ function usageBarColor(pct: number): string {
   if (pct >= 80) return 'bg-red-400';
   if (pct >= 50) return 'bg-amber-400';
   return 'bg-emerald-400';
+}
+
+function accountCostLabel(accountId: number, period: AccountCostPeriod): string {
+  const cost = accountCost(accountId, period);
+  if (!cost) return '—';
+  const prefix = cost.costComplete ? '' : '已知 ';
+  return `${prefix}${formatNanoUsd(cost.knownCostNanoUsd)}`;
+}
+
+function accountCostTitle(accountId: number, period: AccountCostPeriod): string {
+  const cost = accountCost(accountId, period);
+  if (!cost) return '账号成本加载失败或尚未完成';
+  return cost.costComplete ? '已定价 USD 成本' : '部分 Token 未定价，当前仅显示已知 USD 成本';
+}
+
+function accountCostIncomplete(accountId: number, period: AccountCostPeriod): boolean {
+  return accountCost(accountId, period)?.costComplete === false;
 }
 
 /**
@@ -737,6 +766,34 @@ async function copyText(text: string) {
                 {{ new Date(a.usage_fetched_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) }}
               </p>
               <p v-else class="text-[10px] text-[#b5b0a6]">未刷新</p>
+            </div>
+            <div class="grid grid-cols-2 gap-3 border-y border-[#f0ebe4] py-2.5">
+              <div class="min-w-0">
+                <div class="flex items-center gap-1.5">
+                  <span class="rounded bg-[#c4704f]/10 px-1.5 py-0.5 text-[10px] font-medium text-[#a75234]">今日</span>
+                  <span class="text-[10px] text-[#b5b0a6]">USD</span>
+                </div>
+                <p
+                  class="mt-1 truncate text-sm font-semibold text-[#29261e]"
+                  :class="{ 'text-amber-700': accountCostIncomplete(a.id, 'today') }"
+                  :title="accountCostTitle(a.id, 'today')"
+                >
+                  {{ accountCostLabel(a.id, 'today') }}
+                </p>
+              </div>
+              <div class="min-w-0 border-l border-[#f0ebe4] pl-3">
+                <div class="flex items-center gap-1.5">
+                  <span class="rounded bg-[#29261e]/8 px-1.5 py-0.5 text-[10px] font-medium text-[#4d483f]">近 30 日</span>
+                  <span class="text-[10px] text-[#b5b0a6]">USD</span>
+                </div>
+                <p
+                  class="mt-1 truncate text-sm font-semibold text-[#29261e]"
+                  :class="{ 'text-amber-700': accountCostIncomplete(a.id, 'last_30_days') }"
+                  :title="accountCostTitle(a.id, 'last_30_days')"
+                >
+                  {{ accountCostLabel(a.id, 'last_30_days') }}
+                </p>
+              </div>
             </div>
             <!-- 状态徽章行：Opus/Sonnet 自动限流 / 全局 status / overage / 瓶颈 / 数据源 -->
             <div v-if="usageHasBadges(a.usage_data) || isOpusAutoLimited(a) || isSonnetAutoLimited(a)" class="flex flex-wrap gap-1">

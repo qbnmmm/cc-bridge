@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { UsageBreakdownRow, UsageGroupBy } from '@/api'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { formatNanoUsd } from '@/lib/usage'
 
 const props = defineProps<{ rows: UsageBreakdownRow[]; groupBy: UsageGroupBy }>()
 
@@ -14,12 +15,6 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
 }
 
-function formatUsd(value: string): string {
-  const nano = BigInt(value)
-  const whole = nano / 1_000_000_000n
-  const fraction = (nano % 1_000_000_000n).toString().padStart(9, '0').replace(/0+$/, '')
-  return `$${whole.toLocaleString('en-US')}${fraction ? `.${fraction.slice(0, 6)}` : ''}`
-}
 </script>
 
 <template>
@@ -49,7 +44,7 @@ function formatUsd(value: string): string {
             </TableCell>
             <TableCell class="text-right">{{ formatNumber(row.metrics.tokens.cache_read) }}</TableCell>
             <TableCell class="text-right" :class="{ 'text-amber-700': !row.metrics.cost_complete }">
-              {{ formatUsd(row.metrics.known_cost_nano_usd) }}{{ row.metrics.cost_complete ? '' : ' +' }}
+              {{ formatNanoUsd(row.metrics.known_cost_nano_usd) }}{{ row.metrics.cost_complete ? '' : ' +' }}
             </TableCell>
           </TableRow>
         </TableBody>

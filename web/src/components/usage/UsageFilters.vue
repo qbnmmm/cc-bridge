@@ -7,19 +7,29 @@ import type {
   UsageGroupBy,
   UsageQueryParams,
 } from '@/api'
+import type { UsageDatePreset, UsageDateShortcut } from '@/lib/usage'
 
 const props = defineProps<{
   filters: UsageQueryParams
   dimensions: UsageDimensions
   loading: boolean
+  datePreset: UsageDatePreset
 }>()
 
 const emit = defineEmits<{
   reload: []
   setGranularity: [value: UsageGranularity]
   setGroupBy: [value: UsageGroupBy]
+  setDatePreset: [value: UsageDateShortcut]
   updateFilters: [value: Partial<UsageQueryParams>]
 }>()
+
+const datePresets: Array<{ value: UsageDateShortcut; label: string }> = [
+  { value: 'today', label: '今天' },
+  { value: 'this_week', label: '本周' },
+  { value: 'this_month', label: '本月' },
+  { value: 'last_30_days', label: '近 30 日' },
+]
 
 const granularities: Array<{ value: UsageGranularity; label: string }> = [
   { value: 'day', label: '日' },
@@ -45,20 +55,44 @@ function optionalId(event: Event): number | undefined {
 
 <template>
   <section class="space-y-3 border-y border-[#e8e2d9] py-4">
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div class="flex h-9 rounded-md border border-[#d9d2c8] bg-white p-1" aria-label="聚合粒度">
-        <button
-          v-for="item in granularities"
-          :key="item.value"
-          type="button"
-          class="min-w-12 px-3 text-sm rounded transition-colors"
-          :class="props.filters.granularity === item.value
-            ? 'bg-[#29261e] text-white'
-            : 'text-[#716a5e] hover:bg-[#f0ebe4]'"
-          @click="emit('setGranularity', item.value)"
-        >
-          {{ item.label }}
-        </button>
+    <div class="flex flex-wrap items-end justify-between gap-3">
+      <div class="flex flex-wrap items-end gap-3">
+        <div class="space-y-1">
+          <p class="text-xs text-[#716a5e]">查询范围</p>
+          <div class="flex h-9 rounded-md border border-[#d9d2c8] bg-white p-1" aria-label="查询范围">
+            <button
+              v-for="item in datePresets"
+              :key="item.value"
+              type="button"
+              class="min-w-12 rounded px-2 text-sm transition-colors"
+              :class="props.datePreset === item.value
+                ? 'bg-[#c4704f] text-white'
+                : 'text-[#716a5e] hover:bg-[#f0ebe4]'"
+              :aria-pressed="props.datePreset === item.value"
+              @click="emit('setDatePreset', item.value)"
+            >
+              {{ item.label }}
+            </button>
+          </div>
+        </div>
+        <div class="space-y-1">
+          <p class="text-xs text-[#716a5e]">聚合粒度</p>
+          <div class="flex h-9 rounded-md border border-[#d9d2c8] bg-white p-1" aria-label="聚合粒度">
+            <button
+              v-for="item in granularities"
+              :key="item.value"
+              type="button"
+              class="min-w-12 rounded px-3 text-sm transition-colors"
+              :class="props.filters.granularity === item.value
+                ? 'bg-[#29261e] text-white'
+                : 'text-[#716a5e] hover:bg-[#f0ebe4]'"
+              :aria-pressed="props.filters.granularity === item.value"
+              @click="emit('setGranularity', item.value)"
+            >
+              {{ item.label }}
+            </button>
+          </div>
+        </div>
       </div>
       <Button
         variant="outline"

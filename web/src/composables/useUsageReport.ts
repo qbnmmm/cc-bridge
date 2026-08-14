@@ -7,29 +7,25 @@ import {
   type UsageQueryParams,
   type UsageReport,
 } from '@/api'
-
-function singaporeDate(offsetDays = 0): string {
-  const formatter = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Singapore',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  })
-  const date = new Date(Date.now() + offsetDays * 86_400_000)
-  return formatter.format(date)
-}
+import {
+  usageDateRange,
+  type UsageDatePreset,
+  type UsageDateShortcut,
+} from '@/lib/usage'
 
 export function useUsageReport() {
+  const initialDateRange = usageDateRange('today')
   const filters = reactive<UsageQueryParams>({
     granularity: 'day',
-    start_date: singaporeDate(-29),
-    end_date: singaporeDate(),
+    start_date: initialDateRange.startDate,
+    end_date: initialDateRange.endDate,
     group_by: 'model',
   })
   const report = shallowRef<UsageReport | null>(null)
   const dimensions = shallowRef<UsageDimensions>({ accounts: [], api_tokens: [], models: [] })
   const loading = shallowRef(false)
   const error = shallowRef('')
+  const datePreset = shallowRef<UsageDatePreset>('today')
   let controller: AbortController | null = null
 
   const hasIngestionGap = computed(() => {
@@ -42,7 +38,6 @@ export function useUsageReport() {
           health.parse_oversize_total > 0),
     )
   })
-
   async function loadDimensions() {
     try {
       dimensions.value = await api.getUsageDimensions()
@@ -74,6 +69,7 @@ export function useUsageReport() {
   }
 
   function applyFilters(value: Partial<UsageQueryParams>) {
+    if ('start_date' in value || 'end_date' in value) datePreset.value = 'custom'
     Object.assign(filters, value)
     void fetchReport(true)
   }
@@ -84,6 +80,13 @@ export function useUsageReport() {
 
   function setGroupBy(value: UsageGroupBy) {
     applyFilters({ group_by: value })
+  }
+
+  function setDatePreset(value: UsageDateShortcut) {
+    const range = usageDateRange(value)
+    datePreset.value = value
+    Object.assign(filters, { start_date: range.startDate, end_date: range.endDate })
+    void fetchReport(true)
   }
 
   onMounted(() => {
@@ -98,9 +101,11 @@ export function useUsageReport() {
     loading,
     error,
     hasIngestionGap,
+    datePreset,
     loadReport,
     applyFilters,
     setGranularity,
     setGroupBy,
+    setDatePreset,
   }
 }

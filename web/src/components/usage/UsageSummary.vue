@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { AlertTriangle, CircleDollarSign, Database, MessagesSquare } from 'lucide-vue-next'
 import type { UsageMetrics } from '@/api'
+import { formatNanoUsd } from '@/lib/usage'
 
 const props = defineProps<{ metrics: UsageMetrics }>()
 
@@ -8,12 +9,6 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
 }
 
-function formatUsd(nanoUsd: string): string {
-  const value = BigInt(nanoUsd)
-  const whole = value / 1_000_000_000n
-  const fraction = (value % 1_000_000_000n).toString().padStart(9, '0').replace(/0+$/, '')
-  return `$${whole.toLocaleString('en-US')}${fraction ? `.${fraction.slice(0, 6)}` : ''}`
-}
 </script>
 
 <template>
@@ -32,7 +27,7 @@ function formatUsd(nanoUsd: string): string {
       <article class="summary-cell">
         <CircleDollarSign class="size-4 text-sky-600" />
         <p class="summary-label">{{ props.metrics.cost_complete ? '成本' : '已知成本' }}</p>
-        <p class="summary-value">{{ formatUsd(props.metrics.known_cost_nano_usd) }}</p>
+        <p class="summary-value">{{ formatNanoUsd(props.metrics.known_cost_nano_usd) }}</p>
       </article>
       <article class="summary-cell">
         <AlertTriangle class="size-4" :class="props.metrics.cost_complete ? 'text-[#a8a298]' : 'text-amber-600'" />

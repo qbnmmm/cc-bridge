@@ -8,6 +8,7 @@ pub struct Config {
     pub redis: Option<RedisConfig>,
     pub admin: AdminConfig,
     pub log_level: String,
+    pub log_dir: String,
     pub usage_pricing_overrides_json: Option<String>,
 }
 
@@ -127,6 +128,9 @@ impl Config {
                 password: env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "admin".into()),
             },
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
+            log_dir: env_var("LOG_DIR")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "data/logs".into()),
             usage_pricing_overrides_json: env_var("USAGE_PRICING_OVERRIDES_JSON")
                 .filter(|value| !value.trim().is_empty()),
         }

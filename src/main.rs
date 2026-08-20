@@ -10,13 +10,8 @@ use tracing::info;
 async fn main() {
     let cfg = config::Config::load();
 
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| cfg.log_level.clone().into()),
-        )
-        .init();
+    // 初始化日志；guard 必须存活到进程退出，确保非阻塞文件 writer 持续刷新。
+    let _log_guard = claude_code_gateway::logging::init(&cfg.log_level, &cfg.log_dir);
 
     // 注册 sqlx Any 驱动
     sqlx::any::install_default_drivers();

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
-import { api, type Account, type OAuthExchangeResult, type UpdateAccountRequest, type UsageData } from '../api';
+import { api, type Account, type OAuthExchangeResult, type UpdateAccountRequest, type UsageData, type UsageWindow } from '../api';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -20,6 +20,10 @@ const { accountCost, loadAccountUsageCosts } = useAccountUsageCosts();
 
 /** 账号列表 */
 const accounts = ref<Account[]>([]);
+/** 每个账号实际存在的模型级周限额。 */
+const scopedUsageByAccount = computed(() => new Map(
+  accounts.value.map(account => [account.id, scopedUsageRows(account.usage_data)]),
+));
 /** 分页状态 */
 const currentPage = ref(1);
 const totalPages = ref(1);
@@ -414,28 +418,91 @@ function isOpusAutoLimited(a: Account): boolean {
   return false;
 }
 
-/**
- * Sonnet 自动限流判定：账号级受限 OR Sonnet 专属受限
- * （seven_day_sonnet≥97% / sonnet_rate_limited_until 未过期）。
- */
-function isSonnetAutoLimited(a: Account): boolean {
-  if (isOpusAutoLimited(a)) return true;
+function isScopedAutoLimited(a: Account, modelGroup: string): boolean {
   const u = a.usage_data;
   if (!u) return false;
-  if ((u.seven_day_sonnet?.utilization ?? 0) >= 97) return true;
-  if (u.sonnet_rate_limited_until && new Date(u.sonnet_rate_limited_until) > new Date()) return true;
-  return false;
+  const row = scopedUsageByAccount.value.get(a.id)?.find(item => item.modelGroup === modelGroup);
+  const legacySonnetUntil = modelGroup === 'sonnet' ? u.sonnet_rate_limited_until : undefined;
+  const limitedUntil = u.scoped_rate_limited_until?.[modelGroup] ?? legacySonnetUntil;
+  if (!row && !limitedUntil) return false;
+  if (isOpusAutoLimited(a)) return true;
+  if (row && (row.status === 'rejected' || row.utilization >= 97)) return true;
+  return !!(limitedUntil && new Date(limitedUntil) > new Date());
+}
+
+function isSonnetAutoLimited(a: Account): boolean {
+  return isScopedAutoLimited(a, 'sonnet');
+}
+
+function isFableAutoLimited(a: Account): boolean {
+  return isScopedAutoLimited(a, 'fable');
 }
 
 /**
  * 瓶颈窗口标识转可读中文。
  */
-function formatClaim(claim: string): string {
+interface ScopedUsageRow extends UsageWindow {
+  modelGroup: string;
+  displayName: string;
+}
+
+function fallbackModelName(modelGroup: string): string {
+  if (modelGroup === 'sonnet') return 'Sonnet';
+  if (modelGroup === 'fable') return 'Fable';
+  return modelGroup
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function scopedUsageRows(usage?: UsageData): ScopedUsageRow[] {
+  if (!usage) return [];
+  const rows = new Map<string, ScopedUsageRow>();
+  for (const limit of usage.limits ?? []) {
+    if (limit.type !== 'weekly_scoped') continue;
+    const modelGroup = limit.scope?.model?.model_group?.trim().toLowerCase();
+    if (!modelGroup || !Number.isFinite(limit.utilization) || !limit.resets_at) continue;
+    const displayName = limit.scope?.model?.display_name?.trim() || fallbackModelName(modelGroup);
+    rows.set(modelGroup, {
+      modelGroup,
+      displayName,
+      utilization: limit.utilization,
+      resets_at: limit.resets_at,
+      status: limit.status,
+    });
+  }
+  if (!rows.has('sonnet') && usage.seven_day_sonnet) {
+    rows.set('sonnet', {
+      modelGroup: 'sonnet',
+      displayName: 'Sonnet',
+      ...usage.seven_day_sonnet,
+    });
+  }
+  if (!rows.has('fable') && usage.seven_day_fable) {
+    rows.set('fable', {
+      modelGroup: 'fable',
+      displayName: 'Fable',
+      ...usage.seven_day_fable,
+    });
+  }
+  const rank = (group: string) => group === 'sonnet' ? 0 : group === 'fable' ? 1 : 2;
+  return [...rows.values()].sort((left, right) =>
+    rank(left.modelGroup) - rank(right.modelGroup)
+      || left.displayName.localeCompare(right.displayName),
+  );
+}
+
+function formatClaim(claim: string, scopedRows: ScopedUsageRow[] = []): string {
   switch (claim) {
     case 'five_hour': return '5 小时';
     case 'seven_day': return '7 天';
     case 'seven_day_opus': return '7 天 Opus';
     case 'seven_day_sonnet': return '7 天 Sonnet';
+    case 'seven_day_overage_included': {
+      const fable = scopedRows.find(row => row.modelGroup === 'fable');
+      return fable ? `7 天 ${fable.displayName}` : '7 天套餐内模型额度';
+    }
     default: return claim;
   }
 }
@@ -795,8 +862,8 @@ async function copyText(text: string) {
                 </p>
               </div>
             </div>
-            <!-- 状态徽章行：Opus/Sonnet 自动限流 / 全局 status / overage / 瓶颈 / 数据源 -->
-            <div v-if="usageHasBadges(a.usage_data) || isOpusAutoLimited(a) || isSonnetAutoLimited(a)" class="flex flex-wrap gap-1">
+            <!-- 状态徽章行：账号级/模型级自动限流 / 全局 status / overage / 瓶颈 / 数据源 -->
+            <div v-if="usageHasBadges(a.usage_data) || isOpusAutoLimited(a) || isSonnetAutoLimited(a) || isFableAutoLimited(a)" class="flex flex-wrap gap-1">
               <span v-if="isOpusAutoLimited(a)"
                 class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">
                 Opus 自动限流中
@@ -805,6 +872,10 @@ async function copyText(text: string) {
                 class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">
                 Sonnet 自动限流中
               </span>
+              <span v-if="isFableAutoLimited(a)"
+                class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">
+                Fable 自动限流中
+              </span>
               <span v-if="a.usage_data?.status && a.usage_data.status !== 'allowed'"
                 class="px-1.5 py-0.5 rounded text-[10px] font-medium"
                 :class="a.usage_data.status === 'rejected' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-700'">
@@ -812,7 +883,7 @@ async function copyText(text: string) {
               </span>
               <span v-if="a.usage_data?.representative_claim && a.usage_data?.status !== 'allowed'"
                 class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-50 text-orange-600">
-                瓶颈: {{ formatClaim(a.usage_data.representative_claim) }}
+                瓶颈: {{ formatClaim(a.usage_data.representative_claim, scopedUsageByAccount.get(a.id)) }}
               </span>
               <span v-if="a.usage_data?.overage_status === 'rejected'"
                 class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-50 text-slate-500"
@@ -865,18 +936,24 @@ async function copyText(text: string) {
                   :style="{ width: (a.usage_data?.seven_day ? Math.min(a.usage_data.seven_day.utilization, 100) : 0) + '%' }" />
               </div>
             </div>
-            <!-- 7 天 Sonnet -->
-            <div class="space-y-0.5">
+            <!-- 模型级 7 天限额：上游返回才展示 -->
+            <div v-for="limit in scopedUsageByAccount.get(a.id) ?? []" :key="limit.modelGroup" class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
-                <span class="text-[#8c8475]">7 天 Sonnet</span>
-                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.seven_day_sonnet ? Math.round(a.usage_data.seven_day_sonnet.utilization) : '0' }}%
-                  <span v-if="a.usage_data?.seven_day_sonnet" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(a.usage_data.seven_day_sonnet.resets_at) }}</span>
+                <span class="text-[#8c8475] flex items-center gap-1">
+                  7 天 {{ limit.displayName }}
+                  <span v-if="limit.status && limit.status !== 'allowed'"
+                    class="inline-block w-1.5 h-1.5 rounded-full"
+                    :class="limit.status === 'rejected' ? 'bg-red-500' : 'bg-amber-500'"
+                    :title="limit.status" />
+                </span>
+                <span class="text-[#5c5647] font-medium">{{ Math.round(limit.utilization) }}%
+                  <span class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(limit.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
-                <div :class="usageBarColor(a.usage_data?.seven_day_sonnet ? a.usage_data.seven_day_sonnet.utilization : 0)"
+                <div :class="usageBarColor(limit.utilization)"
                   class="h-full rounded-full transition-all duration-300"
-                  :style="{ width: (a.usage_data?.seven_day_sonnet ? Math.min(a.usage_data.seven_day_sonnet.utilization, 100) : 0) + '%' }" />
+                  :style="{ width: Math.min(limit.utilization, 100) + '%' }" />
               </div>
             </div>
           </div>

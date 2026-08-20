@@ -188,8 +188,7 @@ impl GatewayService {
             (vec![], vec![])
         };
 
-        // Sonnet 请求旁路：让本地限流状态不拦截 Sonnet，由 Anthropic 自己拒。
-        // 约定：request body 里 model 字段含 "sonnet"（大小写不敏感）即认定为 Sonnet。
+        // 按请求模型选择账号级或模型级限流视图（Sonnet/Fable 有独立周额度）。
         let model_id_for_class = body_map
             .get("model")
             .and_then(|m| m.as_str())
@@ -342,10 +341,10 @@ impl GatewayService {
 
         // 429 黏性透传：不切号、不 retry，把原 body 替换为通用文案后返回给客户端。
         // absorb_headers 已在 forward_request 里执行，state 更新后续请求会自动避开。
-        if crate::service::limit::is_sonnet_rejection(resp.headers()) {
+        if let Some(group) = crate::service::limit::scoped_rejection_group(resp.headers()) {
             info!(
-                "account {} returned 429 for sonnet quota (sticky, no retry)",
-                account.id
+                "account {} returned 429 for {} quota (sticky, no retry)",
+                account.id, group
             );
         } else {
             warn!(

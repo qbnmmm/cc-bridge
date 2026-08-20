@@ -207,6 +207,7 @@ curl http://127.0.0.1:5674/v1/messages \
 | `TLS_CERT_FILE` | - | 证书路径（需反代终止 TLS） |
 | `TLS_KEY_FILE` | - | 私钥路径 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `LOG_DIR` | `data/logs` | 文件日志目录；单文件 30 MiB，当前文件加历史文件最多 10 个；同时保留终端输出 |
 | `ADMIN_PASSWORD` | `admin` | 管理后台密码 |
 
 ### 数据库

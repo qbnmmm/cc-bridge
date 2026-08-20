@@ -26,20 +26,23 @@ const DEFAULT_429_BAN: Duration = Duration::from_secs(60);
 /// SetupToken RPM/TPM 预抢阈值：任一 counter 的 remaining/limit 低于该值即视为预抢。
 const PREEMPT_RATIO: f64 = 0.03;
 
-/// 请求的模型归类。用于按 `(account, model)` 维度维护独立的 `LimitState`。
-/// Sonnet 有自己的限流视图（周子 quota、Sonnet 429 短期 ban）；其它模型（Opus、Haiku 等）归 Opus 桶。
+/// 请求的模型归类。Sonnet/Fable 有独立的模型级周额度；其它模型沿用账号级限额。
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum ModelClass {
     Opus,
     Sonnet,
+    Fable,
 }
 
 impl ModelClass {
     pub fn from_model_id(model_id: &str) -> Self {
-        if model_id.to_ascii_lowercase().contains("sonnet") {
-            ModelClass::Sonnet
+        let lower = model_id.to_ascii_lowercase();
+        if lower.contains("sonnet") {
+            Self::Sonnet
+        } else if lower.contains("fable") {
+            Self::Fable
         } else {
-            ModelClass::Opus
+            Self::Opus
         }
     }
 
@@ -47,6 +50,15 @@ impl ModelClass {
         match self {
             Self::Opus => "opus",
             Self::Sonnet => "sonnet",
+            Self::Fable => "fable",
+        }
+    }
+
+    fn scoped_group(self) -> Option<&'static str> {
+        match self {
+            Self::Sonnet => Some("sonnet"),
+            Self::Fable => Some("fable"),
+            Self::Opus => None,
         }
     }
 }
@@ -110,6 +122,13 @@ pub struct WindowSnapshot {
     pub surpassed_threshold: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ScopedLimitSnapshot {
+    pub model_group: String,
+    pub display_name: String,
+    pub window: WindowSnapshot,
+}
+
 /// SetupToken（API key）账号的单个 RPM/TPM counter。
 #[derive(Debug, Clone)]
 pub struct RpmTpmCounter {
@@ -163,9 +182,7 @@ impl RpmTpmSnapshot {
 
 /// 判定某个 counter 是否已进入预抢阶段：remaining/limit < PREEMPT_RATIO 且 reset 未到。
 fn counter_preempted(c: &RpmTpmCounter, now: DateTime<Utc>) -> bool {
-    c.limit > 0
-        && (c.remaining as f64) / (c.limit as f64) < PREEMPT_RATIO
-        && c.reset_at > now
+    c.limit > 0 && (c.remaining as f64) / (c.limit as f64) < PREEMPT_RATIO && c.reset_at > now
 }
 
 #[derive(Debug, Clone, Default)]
@@ -187,7 +204,12 @@ pub struct LimitState {
     /// SetupToken 账号的 RPM/TPM 四路状态。OAuth 账号一般为 None。
     pub rpm_tpm: Option<RpmTpmSnapshot>,
 
-    // ---- Sonnet overlay（仅 Sonnet 请求看）----
+    /// `/api/oauth/usage limits[]` 与模型级响应头规范化后的周额度。
+    pub scoped_weekly: HashMap<String, ScopedLimitSnapshot>,
+    /// 模型级短期 429 隔离，key 为 model_group。
+    pub scoped_rate_limited_until: HashMap<String, DateTime<Utc>>,
+
+    // ---- Sonnet 兼容 mirror ----
     /// Sonnet 子 quota 的 7d 窗口（来自 `/api/oauth/usage` 的 `seven_day_sonnet`，
     /// 或响应头 `representative_claim=seven_day_sonnet` 时的 unified-7d）。
     pub sonnet_seven_day: Option<WindowSnapshot>,
@@ -265,12 +287,18 @@ impl LimitStore {
                 .map(|w| w.utilization)
                 .unwrap_or(0.0);
             let sonnet_seven = new_state
-                .sonnet_seven_day
-                .as_ref()
-                .map(|w| w.utilization)
+                .scoped_weekly
+                .get("sonnet")
+                .map(|item| item.window.utilization)
+                .or_else(|| new_state.sonnet_seven_day.as_ref().map(|w| w.utilization))
+                .unwrap_or(0.0);
+            let fable_seven = new_state
+                .scoped_weekly
+                .get("fable")
+                .map(|item| item.window.utilization)
                 .unwrap_or(0.0);
             info!(
-                "limit absorb: account {} [{}] status={} → flush ({}) 5h={:.1}% 7d={:.1}% sonnet_7d={:.1}% status={}",
+                "limit absorb: account {} [{}] status={} → flush ({}) 5h={:.1}% 7d={:.1}% sonnet_7d={:.1}% fable_7d={:.1}% status={}",
                 account_id,
                 model_class.as_str(),
                 status,
@@ -278,6 +306,7 @@ impl LimitStore {
                 five * 100.0,
                 seven * 100.0,
                 sonnet_seven * 100.0,
+                fable_seven * 100.0,
                 new_state.status.unwrap_or(UnifiedStatus::Allowed).as_str(),
             );
         } else {
@@ -341,27 +370,11 @@ impl LimitStore {
     }
 
     /// 从 `/api/oauth/usage` JSON（0-100 刻度）同步到内存。
-    /// - `five_hour` → `state.five_hour`
-    /// - `seven_day`（聚合）→ `state.seven_day`
-    /// - `seven_day_opus`（若存在，覆盖聚合）→ `state.seven_day`
-    /// - `seven_day_sonnet` → `state.sonnet_seven_day`
+    /// 同时兼容旧固定字段和新 `limits[].type=weekly_scoped` 模型级窗口。
     pub fn ingest_usage_json(&self, account_id: i64, usage: &serde_json::Value) {
         let mut map = self.states.lock().unwrap();
         let mut state = map.get(&account_id).cloned().unwrap_or_default();
-        if let Some(w) = parse_usage_json_window(usage, "five_hour") {
-            state.five_hour = Some(w);
-        }
-        if let Some(w) = parse_usage_json_window(usage, "seven_day") {
-            state.seven_day = Some(w);
-        }
-        if let Some(w) = parse_usage_json_window(usage, "seven_day_opus") {
-            // seven_day_opus 是 Anthropic 细分的 Opus 子 quota；用户确认实际上不独立 enforce，
-            // 和聚合 `seven_day` 同义。若存在以它为准覆盖。
-            state.seven_day = Some(w);
-        }
-        if let Some(w) = parse_usage_json_window(usage, "seven_day_sonnet") {
-            state.sonnet_seven_day = Some(w);
-        }
+        apply_usage_json(&mut state, usage);
         state.updated_at = Some(Instant::now());
         map.insert(account_id, state);
     }
@@ -391,10 +404,10 @@ fn compute_new_state(
 
     if parsed_unified.is_some() || parsed_rpm_tpm.is_some() {
         let mut s = prev.clone();
-        let is_sonnet_claim = parsed_unified
+        let claim_group = parsed_unified
             .as_ref()
-            .and_then(|p| p.representative_claim.as_deref())
-            == Some("seven_day_sonnet");
+            .and_then(|parsed| scoped_claim_group(parsed.representative_claim.as_deref()));
+        let current_reset_at = parsed_unified.as_ref().and_then(|parsed| parsed.reset_at);
 
         if let Some(u) = parsed_unified {
             s = apply_parsed(s, u);
@@ -403,15 +416,22 @@ fn compute_new_state(
             s.rpm_tpm = Some(merge_rpm_tpm(s.rpm_tpm.take(), r));
         }
 
-        // 429 + retry-after 的短期 ban 兜底：若 rep_claim 是 Sonnet 子 quota，只写 Sonnet overlay
-        // （不封 Opus）；否则写账号级。
-        if status == 429 && s.reset_at.is_none() {
-            if let Some(ra) = retry_after {
-                let until = Utc::now() + chrono::Duration::from_std(ra).unwrap_or_default();
-                if is_sonnet_claim && matches!(model_class, ModelClass::Sonnet) {
-                    s.sonnet_rate_limited_until = Some(until);
-                } else {
-                    s.rate_limited_until = Some(until);
+        if status == 429 {
+            if let Some(group) = claim_group {
+                // 模型级 claim 的 reset/retry-after 都只能隔离对应模型。
+                let until = current_reset_at.or_else(|| {
+                    retry_after.map(|duration| {
+                        Utc::now() + chrono::Duration::from_std(duration).unwrap_or_default()
+                    })
+                });
+                if let Some(until) = until {
+                    set_scoped_ban(&mut s, group, until);
+                }
+            } else if current_reset_at.is_none() {
+                // 账号级响应已有 reset 时由 status/window 判定；没有时用 retry-after 兜底。
+                if let Some(duration) = retry_after {
+                    s.rate_limited_until =
+                        Some(Utc::now() + chrono::Duration::from_std(duration).unwrap_or_default());
                 }
             }
         }
@@ -419,14 +439,12 @@ fn compute_new_state(
     }
 
     if status == 429 {
-        // CF-layer 429：无任何 unified-* / RPM/TPM 头，仅设短期 ban。Sonnet 请求撞 CF-layer 时
-        // 也只影响 Sonnet overlay，因为 CF 层和 Anthropic 的模型无关，本来就不该封整个账号。
-        // 但保守起见：Sonnet 请求 → sonnet_rate_limited_until；其他 → 账号级。
+        // CF-layer 429：无 unified headers 时按请求模型隔离已知 scoped 模型；其它保持账号级。
         let mut s = prev.clone();
         let ban = retry_after.unwrap_or(DEFAULT_429_BAN);
         let ban_until = Utc::now() + chrono::Duration::from_std(ban).unwrap_or_default();
-        if matches!(model_class, ModelClass::Sonnet) {
-            s.sonnet_rate_limited_until = Some(ban_until);
+        if let Some(group) = model_class.scoped_group() {
+            set_scoped_ban(&mut s, group, ban_until);
         } else {
             s.rate_limited_until = Some(ban_until);
         }
@@ -439,6 +457,7 @@ fn compute_new_state(
 struct ParsedHeaders {
     five_hour: Option<WindowSnapshot>,
     seven_day: Option<WindowSnapshot>,
+    scoped_weekly: Vec<ScopedLimitSnapshot>,
     status: Option<UnifiedStatus>,
     representative_claim: Option<String>,
     reset_at: Option<DateTime<Utc>>,
@@ -452,6 +471,7 @@ impl ParsedHeaders {
     fn any_present(&self) -> bool {
         self.five_hour.is_some()
             || self.seven_day.is_some()
+            || !self.scoped_weekly.is_empty()
             || self.status.is_some()
             || self.representative_claim.is_some()
             || self.reset_at.is_some()
@@ -464,17 +484,40 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-/// 判定响应是否为 Sonnet 周限流（`representative-claim == "seven_day_sonnet"`）。
-/// gateway 在 429 分流时使用：命中时直接透传，不 retry / 不拉黑账号。
+/// 返回已知模型级 representative claim 对应的 model group。
+pub fn scoped_rejection_group(headers: &HeaderMap) -> Option<&'static str> {
+    scoped_claim_group(header_str(
+        headers,
+        "anthropic-ratelimit-unified-representative-claim",
+    ))
+}
+
+/// 兼容旧调用方与测试。
 pub fn is_sonnet_rejection(headers: &HeaderMap) -> bool {
-    header_str(headers, "anthropic-ratelimit-unified-representative-claim")
-        == Some("seven_day_sonnet")
+    scoped_rejection_group(headers) == Some("sonnet")
 }
 
 fn parse_unified_headers(headers: &HeaderMap) -> Option<ParsedHeaders> {
+    let mut scoped_weekly = Vec::new();
+    if let Some(window) = parse_window_from_headers(headers, "7d_sonnet") {
+        scoped_weekly.push(ScopedLimitSnapshot {
+            model_group: "sonnet".into(),
+            display_name: "Sonnet".into(),
+            window,
+        });
+    }
+    if let Some(window) = parse_window_from_headers(headers, "7d_oi") {
+        scoped_weekly.push(ScopedLimitSnapshot {
+            model_group: "fable".into(),
+            display_name: "Fable".into(),
+            window,
+        });
+    }
+
     let parsed = ParsedHeaders {
         five_hour: parse_window_from_headers(headers, "5h"),
         seven_day: parse_window_from_headers(headers, "7d"),
+        scoped_weekly,
         status: header_str(headers, "anthropic-ratelimit-unified-status")
             .and_then(UnifiedStatus::parse),
         representative_claim: header_str(
@@ -623,12 +666,138 @@ fn parse_usage_json_window(usage: &serde_json::Value, key: &str) -> Option<Windo
     })
 }
 
+fn apply_usage_json(state: &mut LimitState, usage: &serde_json::Value) {
+    if let Some(w) = parse_usage_json_window(usage, "five_hour") {
+        state.five_hour = Some(w);
+    }
+    if let Some(w) = parse_usage_json_window(usage, "seven_day") {
+        state.seven_day = Some(w);
+    }
+    if let Some(w) = parse_usage_json_window(usage, "seven_day_opus") {
+        // 保留既有语义：Opus 旧字段覆盖聚合周窗口，不作为独立 selector overlay。
+        state.seven_day = Some(w);
+    }
+
+    // `limits` 一旦明确出现（包括 null/[]），就是模型级窗口的完整快照；先清空旧值。
+    // 老响应完全没有该字段时保留实时 header 热态，再用 legacy Sonnet 字段覆盖。
+    if usage.get("limits").is_some() {
+        state.scoped_weekly.clear();
+        state.sonnet_seven_day = None;
+    }
+    let scoped = parse_usage_json_scoped_limits(usage);
+    let has_dynamic_sonnet = scoped.iter().any(|item| item.model_group == "sonnet");
+    for item in scoped {
+        set_scoped_window(state, item);
+    }
+    if !has_dynamic_sonnet {
+        if let Some(w) = parse_usage_json_window(usage, "seven_day_sonnet") {
+            set_scoped_window(
+                state,
+                ScopedLimitSnapshot {
+                    model_group: "sonnet".into(),
+                    display_name: "Sonnet".into(),
+                    window: w,
+                },
+            );
+        }
+    }
+}
+
+fn parse_usage_json_scoped_limits(usage: &serde_json::Value) -> Vec<ScopedLimitSnapshot> {
+    let Some(items) = usage.get("limits").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            if item.get("type").and_then(|value| value.as_str()) != Some("weekly_scoped") {
+                return None;
+            }
+            let model = item.get("scope")?.get("model")?;
+            let model_group = model
+                .get("model_group")?
+                .as_str()?
+                .trim()
+                .to_ascii_lowercase();
+            if model_group.is_empty() {
+                return None;
+            }
+            let utilization = item.get("utilization")?.as_f64()?;
+            if !utilization.is_finite() || utilization < 0.0 {
+                return None;
+            }
+            let resets_at = DateTime::parse_from_rfc3339(item.get("resets_at")?.as_str()?)
+                .ok()?
+                .with_timezone(&Utc);
+            let display_name = model
+                .get("display_name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| default_scoped_display_name(&model_group));
+            Some(ScopedLimitSnapshot {
+                model_group,
+                display_name,
+                window: WindowSnapshot {
+                    utilization: utilization / 100.0,
+                    resets_at,
+                    status: UnifiedStatus::Allowed,
+                    surpassed_threshold: None,
+                },
+            })
+        })
+        .collect()
+}
+
+fn default_scoped_display_name(model_group: &str) -> String {
+    match model_group {
+        "sonnet" => "Sonnet".into(),
+        "fable" => "Fable".into(),
+        other => other
+            .split(['_', '-'])
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn scoped_claim_group(claim: Option<&str>) -> Option<&'static str> {
+    match claim {
+        Some("seven_day_sonnet") => Some("sonnet"),
+        Some("seven_day_overage_included") => Some("fable"),
+        _ => None,
+    }
+}
+
+fn set_scoped_window(state: &mut LimitState, item: ScopedLimitSnapshot) {
+    if item.model_group == "sonnet" {
+        state.sonnet_seven_day = Some(item.window.clone());
+    }
+    state.scoped_weekly.insert(item.model_group.clone(), item);
+}
+
+fn set_scoped_ban(state: &mut LimitState, model_group: &str, until: DateTime<Utc>) {
+    state
+        .scoped_rate_limited_until
+        .insert(model_group.to_string(), until);
+    if model_group == "sonnet" {
+        state.sonnet_rate_limited_until = Some(until);
+    }
+}
+
 fn apply_parsed(mut state: LimitState, parsed: ParsedHeaders) -> LimitState {
-    // 5h 无条件吸收（账号级，客观事实）
     if let Some(w) = parsed.five_hour {
         state.five_hour = Some(w);
     }
-    // overage / rep_claim / reset_at / fallback 无条件吸收（展示字段）
     if let Some(c) = &parsed.representative_claim {
         state.representative_claim = Some(c.clone());
     }
@@ -647,22 +816,44 @@ fn apply_parsed(mut state: LimitState, parsed: ParsedHeaders) -> LimitState {
     if let Some(r) = parsed.overage_reset_at {
         state.overage_reset_at = Some(r);
     }
-    // 7d 与 status 按 rep_claim 分路：
-    // - rep_claim == "seven_day_sonnet"：Sonnet 子 quota 已触顶；只写 Sonnet overlay，
-    //   status 丢弃（不禁用整个账号，Opus 仍可用）。
-    // - 其它：写账号级 seven_day + status，影响两模型。
-    let is_sonnet_claim = parsed.representative_claim.as_deref() == Some("seven_day_sonnet");
-    if is_sonnet_claim {
-        if let Some(w) = parsed.seven_day {
-            state.sonnet_seven_day = Some(w);
-        }
-        // parsed.status 有意丢弃
-    } else {
-        if let Some(w) = parsed.seven_day {
+
+    let claim_group = scoped_claim_group(parsed.representative_claim.as_deref());
+    let mut explicit_groups = Vec::new();
+    for item in parsed.scoped_weekly {
+        explicit_groups.push(item.model_group.clone());
+        set_scoped_window(&mut state, item);
+    }
+
+    // 新响应有显式 7d_sonnet/7d_oi 时，通用 7d 是账号级事实。
+    // 旧响应只有 scoped representative claim + 通用 7d 时，沿用旧语义把它路由到模型级，
+    // 避免把 Sonnet/Fable 子额度误写成账号级周额度。
+    if let Some(mut w) = parsed.seven_day {
+        let legacy_scoped_group = claim_group.filter(|group| {
+            !explicit_groups
+                .iter()
+                .any(|explicit_group| explicit_group == group)
+        });
+        if let Some(group) = legacy_scoped_group {
+            if let Some(status) = parsed.status {
+                w.status = status;
+            }
+            set_scoped_window(
+                &mut state,
+                ScopedLimitSnapshot {
+                    model_group: group.into(),
+                    display_name: default_scoped_display_name(group),
+                    window: w,
+                },
+            );
+        } else {
             state.seven_day = Some(w);
         }
-        if let Some(s) = parsed.status {
-            state.status = Some(s);
+    }
+
+    // 模型级 rejected 不得写入账号级状态，否则会错误禁用其它模型。
+    if claim_group.is_none() {
+        if let Some(status) = parsed.status {
+            state.status = Some(status);
         }
     }
     state
@@ -686,26 +877,40 @@ fn flush_reason(prev: &LimitState, new: &LimitState) -> Option<&'static str> {
     if prev_status == UnifiedStatus::Allowed && new_status != UnifiedStatus::Allowed {
         return Some("status-changed");
     }
-    // 4) 任一窗口 utilization 跨过 97%（含 Sonnet overlay）
+    if new
+        .scoped_weekly
+        .keys()
+        .any(|group| !prev.scoped_weekly.contains_key(group))
+    {
+        return Some("scoped-window-added");
+    }
+    if scoped_status_tightened(prev, new) {
+        return Some("scoped-status-changed");
+    }
+    // 4) 任一账号级或模型级窗口 utilization 跨过 97%。
     if crossed_threshold(&prev.five_hour, &new.five_hour, HIT_THRESHOLD)
         || crossed_threshold(&prev.seven_day, &new.seven_day, HIT_THRESHOLD)
-        || crossed_threshold(&prev.sonnet_seven_day, &new.sonnet_seven_day, HIT_THRESHOLD)
+        || scoped_crossed_threshold(prev, new)
     {
         return Some("threshold-crossed-97pct");
     }
-    // 5) 任一窗口新出现 surpassed-threshold 头
+    // 5) 任一窗口新出现 surpassed-threshold 头。
     if newly_surpassed(&prev.five_hour, &new.five_hour)
         || newly_surpassed(&prev.seven_day, &new.seven_day)
-        || newly_surpassed(&prev.sonnet_seven_day, &new.sonnet_seven_day)
+        || scoped_newly_surpassed(prev, new)
     {
         return Some("surpassed-threshold");
     }
-    // 6) 新进入短期隔离（CF 429 或 Anthropic 429 无 reset；含 Sonnet overlay）
+    // 6) 新进入账号级或模型级短期隔离。
     if prev.rate_limited_until.is_none() && new.rate_limited_until.is_some() {
         return Some("429-short-ban");
     }
-    if prev.sonnet_rate_limited_until.is_none() && new.sonnet_rate_limited_until.is_some() {
-        return Some("429-short-ban-sonnet");
+    if new.scoped_rate_limited_until.iter().any(|(group, until)| {
+        prev.scoped_rate_limited_until
+            .get(group)
+            .is_none_or(|previous| until > previous)
+    }) {
+        return Some("429-short-ban-scoped");
     }
     // 7) RPM/TPM 任一 counter 从"充裕"变"预抢"
     if rpm_tpm_newly_preempted(&prev.rpm_tpm, &new.rpm_tpm) {
@@ -715,13 +920,14 @@ fn flush_reason(prev: &LimitState, new: &LimitState) -> Option<&'static str> {
 }
 
 /// 前后两轮 RPM/TPM 比较：上一轮无任何 counter 预抢、这一轮有 → true。
-fn rpm_tpm_newly_preempted(
-    prev: &Option<RpmTpmSnapshot>,
-    new: &Option<RpmTpmSnapshot>,
-) -> bool {
+fn rpm_tpm_newly_preempted(prev: &Option<RpmTpmSnapshot>, new: &Option<RpmTpmSnapshot>) -> bool {
     let now = Utc::now();
-    let prev_preempted = prev.as_ref().is_some_and(|p| p.first_preempted(now).is_some());
-    let new_preempted = new.as_ref().is_some_and(|n| n.first_preempted(now).is_some());
+    let prev_preempted = prev
+        .as_ref()
+        .is_some_and(|p| p.first_preempted(now).is_some());
+    let new_preempted = new
+        .as_ref()
+        .is_some_and(|n| n.first_preempted(now).is_some());
     new_preempted && !prev_preempted
 }
 
@@ -739,6 +945,36 @@ fn newly_surpassed(prev: &Option<WindowSnapshot>, new: &Option<WindowSnapshot>) 
     let new_has = new.as_ref().and_then(|w| w.surpassed_threshold).is_some();
     let prev_has = prev.as_ref().and_then(|w| w.surpassed_threshold).is_some();
     new_has && !prev_has
+}
+
+fn scoped_status_tightened(prev: &LimitState, new: &LimitState) -> bool {
+    new.scoped_weekly.iter().any(|(group, item)| {
+        let previous = prev
+            .scoped_weekly
+            .get(group)
+            .map(|previous| previous.window.status)
+            .unwrap_or(UnifiedStatus::Allowed);
+        previous == UnifiedStatus::Allowed && item.window.status != UnifiedStatus::Allowed
+    })
+}
+
+fn scoped_crossed_threshold(prev: &LimitState, new: &LimitState) -> bool {
+    new.scoped_weekly.iter().any(|(group, item)| {
+        let previous = prev.scoped_weekly.get(group).map(|item| &item.window);
+        item.window.utilization >= HIT_THRESHOLD
+            && previous.map(|window| window.utilization).unwrap_or(0.0) < HIT_THRESHOLD
+    })
+}
+
+fn scoped_newly_surpassed(prev: &LimitState, new: &LimitState) -> bool {
+    new.scoped_weekly.iter().any(|(group, item)| {
+        item.window.surpassed_threshold.is_some()
+            && prev
+                .scoped_weekly
+                .get(group)
+                .and_then(|previous| previous.window.surpassed_threshold)
+                .is_none()
+    })
 }
 
 /// 返回"瓶颈窗口"的 resets_at（用于 DB 列 rate_limit_reset_at）：
@@ -802,20 +1038,42 @@ fn judge_availability(state: &LimitState, model_class: ModelClass) -> Availabili
             };
         }
     }
-    // ---- Sonnet overlay：仅 Sonnet 请求额外检查 ----
-    if matches!(model_class, ModelClass::Sonnet) {
-        if let Some(until) = state.sonnet_rate_limited_until {
+    // ---- 模型级 overlay：仅对应 Sonnet/Fable 请求额外检查 ----
+    if let Some(group) = model_class.scoped_group() {
+        let legacy_sonnet_ban = (group == "sonnet")
+            .then_some(state.sonnet_rate_limited_until)
+            .flatten();
+        if let Some(until) = state
+            .scoped_rate_limited_until
+            .get(group)
+            .copied()
+            .or(legacy_sonnet_ban)
+        {
             if until > Utc::now() {
                 return Availability::Unavailable {
-                    reason: "Sonnet 429 短期隔离".into(),
+                    reason: format!("{} 429 短期隔离", default_scoped_display_name(group)),
                     until: Some(until),
                 };
             }
         }
-        if let Some(w) = &state.sonnet_seven_day {
-            if w.utilization >= HIT_THRESHOLD && w.resets_at > Utc::now() {
+        let legacy_sonnet_window = (group == "sonnet")
+            .then_some(state.sonnet_seven_day.as_ref())
+            .flatten();
+        if let Some(w) = state
+            .scoped_weekly
+            .get(group)
+            .map(|item| &item.window)
+            .or(legacy_sonnet_window)
+        {
+            if w.status == UnifiedStatus::Rejected
+                || (w.utilization >= HIT_THRESHOLD && w.resets_at > Utc::now())
+            {
                 return Availability::Unavailable {
-                    reason: format!("Sonnet 7 天已用 {:.1}%", w.utilization * 100.0),
+                    reason: format!(
+                        "{} 7 天已用 {:.1}%",
+                        default_scoped_display_name(group),
+                        w.utilization * 100.0
+                    ),
                     until: Some(w.resets_at),
                 };
             }
@@ -843,6 +1101,17 @@ fn build_usage_json(state: &LimitState) -> serde_json::Value {
     }
     if let Some(w) = &state.sonnet_seven_day {
         obj.insert("seven_day_sonnet".into(), window_to_json(w));
+    }
+    if let Some(item) = state.scoped_weekly.get("fable") {
+        obj.insert("seven_day_fable".into(), window_to_json(&item.window));
+    }
+    if !state.scoped_weekly.is_empty() {
+        let mut items = state.scoped_weekly.values().collect::<Vec<_>>();
+        items.sort_by(|left, right| left.model_group.cmp(&right.model_group));
+        obj.insert(
+            "limits".into(),
+            serde_json::Value::Array(items.into_iter().map(scoped_limit_to_json).collect()),
+        );
     }
     if let Some(s) = state.status {
         obj.insert("status".into(), serde_json::Value::from(s.as_str()));
@@ -889,11 +1158,38 @@ fn build_usage_json(state: &LimitState) -> serde_json::Value {
             serde_json::Value::from(until.to_rfc3339()),
         );
     }
+    if !state.scoped_rate_limited_until.is_empty() {
+        let mut bans = serde_json::Map::new();
+        let mut entries = state.scoped_rate_limited_until.iter().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        for (group, until) in entries {
+            bans.insert(group.clone(), serde_json::Value::from(until.to_rfc3339()));
+        }
+        obj.insert(
+            "scoped_rate_limited_until".into(),
+            serde_json::Value::Object(bans),
+        );
+    }
     if let Some(rt) = &state.rpm_tpm {
         obj.insert("rpm_tpm".into(), rpm_tpm_to_json(rt));
     }
     obj.insert("source".into(), serde_json::Value::from("headers"));
     serde_json::Value::Object(obj)
+}
+
+fn scoped_limit_to_json(item: &ScopedLimitSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "type": "weekly_scoped",
+        "scope": {
+            "model": {
+                "model_group": item.model_group,
+                "display_name": item.display_name,
+            }
+        },
+        "utilization": item.window.utilization * 100.0,
+        "resets_at": item.window.resets_at.to_rfc3339(),
+        "status": item.window.status.as_str(),
+    })
 }
 
 fn rpm_tpm_to_json(rt: &RpmTpmSnapshot) -> serde_json::Value {
@@ -962,9 +1258,15 @@ mod tests {
             ("anthropic-ratelimit-unified-7d-status", "allowed"),
             ("anthropic-ratelimit-unified-7d-utilization", "0.03"),
             ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
-            ("anthropic-ratelimit-unified-overage-disabled-reason", "org_level_disabled"),
+            (
+                "anthropic-ratelimit-unified-overage-disabled-reason",
+                "org_level_disabled",
+            ),
             ("anthropic-ratelimit-unified-overage-status", "rejected"),
-            ("anthropic-ratelimit-unified-representative-claim", "five_hour"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
             ("anthropic-ratelimit-unified-reset", "1776427200"),
             ("anthropic-ratelimit-unified-status", "allowed"),
         ])
@@ -1222,7 +1524,8 @@ mod tests {
     }
 
     #[test]
-    fn build_usage_json_converts_to_0_100_scale() {        let state = LimitState {
+    fn build_usage_json_converts_to_0_100_scale() {
+        let state = LimitState {
             five_hour: Some(WindowSnapshot {
                 utilization: 0.14,
                 resets_at: DateTime::from_timestamp(1776427200, 0).unwrap(),
@@ -1254,7 +1557,8 @@ mod tests {
     fn absorb_429_cf_without_headers_sets_60s_ban() {
         let h = make_headers(&[("content-type", "text/html")]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         let until = new.rate_limited_until.expect("rate_limited_until set");
         let expected = Utc::now() + chrono::Duration::seconds(60);
         // 允许 2 秒误差（测试机 clock 漂移）
@@ -1268,7 +1572,8 @@ mod tests {
     fn absorb_429_cf_with_retry_after_uses_it() {
         let h = make_headers(&[("retry-after", "120")]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         let until = new.rate_limited_until.expect("rate_limited_until set");
         let expected = Utc::now() + chrono::Duration::seconds(120);
         let diff = (until - expected).num_seconds().abs();
@@ -1288,7 +1593,8 @@ mod tests {
             ("retry-after", "300"),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         // 5h 窗口应被正常吸收
         assert!(new.five_hour.is_some());
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
@@ -1315,7 +1621,8 @@ mod tests {
             ("anthropic-ratelimit-unified-reset", &reset_ts.to_string()),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         assert!(new.rate_limited_until.is_none(), "不应走 fallback 路径");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         // availability 应判 Unavailable（5h 97%）
@@ -1398,10 +1705,16 @@ mod tests {
             ("anthropic-ratelimit-tokens-remaining", "998000".into()),
             ("anthropic-ratelimit-tokens-reset", reset.clone()),
             ("anthropic-ratelimit-input-tokens-limit", "500000".into()),
-            ("anthropic-ratelimit-input-tokens-remaining", "499000".into()),
+            (
+                "anthropic-ratelimit-input-tokens-remaining",
+                "499000".into(),
+            ),
             ("anthropic-ratelimit-input-tokens-reset", reset.clone()),
             ("anthropic-ratelimit-output-tokens-limit", "500000".into()),
-            ("anthropic-ratelimit-output-tokens-remaining", "499000".into()),
+            (
+                "anthropic-ratelimit-output-tokens-remaining",
+                "499000".into(),
+            ),
             ("anthropic-ratelimit-output-tokens-reset", reset),
         ]
     }
@@ -1596,7 +1909,8 @@ mod tests {
     fn absorb_200_with_rpm_tpm_updates_state() {
         let h = headers_from(rpm_tpm_full_headers());
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
         assert!(new.rpm_tpm.is_some());
         let rt = new.rpm_tpm.unwrap();
         assert_eq!(rt.requests.unwrap().limit, 50);
@@ -1614,7 +1928,8 @@ mod tests {
         ]);
         let h = headers_from(headers);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
         assert!(new.five_hour.is_some(), "unified 路径应被吸收");
         assert!(new.rpm_tpm.is_some(), "RPM/TPM 路径应被吸收");
     }
@@ -1664,16 +1979,29 @@ mod tests {
             ),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Sonnet, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Sonnet, 429, &h).expect("should produce state");
         // status 丢弃 —— 不禁用账号
-        assert_eq!(new.status, None, "rep_claim=seven_day_sonnet 时 status 必须丢弃");
+        assert_eq!(
+            new.status, None,
+            "rep_claim=seven_day_sonnet 时 status 必须丢弃"
+        );
         // 7d 走 Sonnet overlay
-        assert!(new.sonnet_seven_day.is_some(), "7d 数据路由到 sonnet_seven_day");
+        assert!(
+            new.sonnet_seven_day.is_some(),
+            "7d 数据路由到 sonnet_seven_day"
+        );
         assert!(new.seven_day.is_none(), "账号级 seven_day 不被污染");
         // 5h 仍按账号级吸收
-        assert!(new.five_hour.is_some(), "5h 是账号级事实，Sonnet 也必须吸收");
+        assert!(
+            new.five_hour.is_some(),
+            "5h 是账号级事实，Sonnet 也必须吸收"
+        );
         // representative_claim 吸收（UI 展示用）
-        assert_eq!(new.representative_claim.as_deref(), Some("seven_day_sonnet"));
+        assert_eq!(
+            new.representative_claim.as_deref(),
+            Some("seven_day_sonnet")
+        );
         // availability：Opus 不受影响；Sonnet 因 sonnet_seven_day=100% 被拦
         assert!(judge_availability(&new, ModelClass::Opus).is_available());
         assert!(!judge_availability(&new, ModelClass::Sonnet).is_available());
@@ -1692,7 +2020,8 @@ mod tests {
             ),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
+        let new =
+            compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
@@ -1709,7 +2038,8 @@ mod tests {
                 "seven_day",
             ),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
@@ -1726,7 +2056,8 @@ mod tests {
                 "five_hour",
             ),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
@@ -1743,9 +2074,13 @@ mod tests {
                 "seven_day_sonnet",
             ),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Sonnet, 200, &h).expect("state");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Sonnet, 200, &h).expect("state");
         assert_eq!(new.status, None, "rep_claim=seven_day_sonnet → status 丢弃");
-        assert_eq!(new.representative_claim.as_deref(), Some("seven_day_sonnet"));
+        assert_eq!(
+            new.representative_claim.as_deref(),
+            Some("seven_day_sonnet")
+        );
     }
 
     #[test]
@@ -1760,10 +2095,7 @@ mod tests {
     #[test]
     fn is_sonnet_rejection_false_for_other_claims() {
         for claim in ["seven_day_opus", "seven_day", "five_hour"] {
-            let h = make_headers(&[(
-                "anthropic-ratelimit-unified-representative-claim",
-                claim,
-            )]);
+            let h = make_headers(&[("anthropic-ratelimit-unified-representative-claim", claim)]);
             assert!(!is_sonnet_rejection(&h), "claim={} should not match", claim);
         }
         let h_empty = make_headers(&[]);
@@ -1847,9 +2179,12 @@ mod tests {
             ),
             ("retry-after", "30"),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Sonnet, 429, &h)
-            .expect("state");
-        assert!(new.sonnet_rate_limited_until.is_some(), "Sonnet overlay 应设置");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Sonnet, 429, &h).expect("state");
+        assert!(
+            new.sonnet_rate_limited_until.is_some(),
+            "Sonnet overlay 应设置"
+        );
         assert!(new.rate_limited_until.is_none(), "账号级不应被污染");
     }
 
@@ -1864,8 +2199,8 @@ mod tests {
             ),
             ("retry-after", "30"),
         ]);
-        let new = compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h)
-            .expect("state");
+        let new =
+            compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
         assert!(new.rate_limited_until.is_some());
         assert!(new.sonnet_rate_limited_until.is_none());
     }
@@ -1879,5 +2214,221 @@ mod tests {
         };
         assert!(!judge_availability(&state, ModelClass::Opus).is_available());
         assert!(!judge_availability(&state, ModelClass::Sonnet).is_available());
+    }
+    #[test]
+    fn model_class_recognizes_fable() {
+        assert_eq!(
+            ModelClass::from_model_id("claude-fable-5"),
+            ModelClass::Fable
+        );
+        assert_eq!(
+            ModelClass::from_model_id("claude-sonnet-4-6"),
+            ModelClass::Sonnet
+        );
+    }
+
+    #[test]
+    fn parses_dynamic_scoped_limits_and_preserves_them_in_json() {
+        let usage = serde_json::json!({
+            "limits": [
+                {
+                    "type": "weekly_scoped",
+                    "scope": {"model": {"model_group": "fable", "display_name": "Fable"}},
+                    "utilization": 42.0,
+                    "resets_at": "2026-08-27T00:00:00Z"
+                },
+                {
+                    "type": "weekly_scoped",
+                    "scope": {"model": {"model_group": "sonnet", "display_name": "Sonnet"}},
+                    "utilization": 18.0,
+                    "resets_at": "2026-08-28T00:00:00Z"
+                }
+            ]
+        });
+        let items = parse_usage_json_scoped_limits(&usage);
+        assert_eq!(items.len(), 2);
+
+        let mut state = LimitState::default();
+        for item in items {
+            set_scoped_window(&mut state, item);
+        }
+        let json = build_usage_json(&state);
+        let limits = json["limits"].as_array().expect("limits array");
+        assert_eq!(limits.len(), 2);
+        assert_eq!(json["seven_day_sonnet"]["utilization"], 18.0);
+        assert_eq!(json["seven_day_fable"]["utilization"], 42.0);
+    }
+
+    #[test]
+    fn new_scoped_window_triggers_immediate_flush() {
+        let prev = LimitState {
+            last_db_flush_at: Some(Instant::now()),
+            ..Default::default()
+        };
+        let mut new = prev.clone();
+        set_scoped_window(
+            &mut new,
+            ScopedLimitSnapshot {
+                model_group: "fable".into(),
+                display_name: "Fable".into(),
+                window: mk_window(0.1),
+            },
+        );
+
+        assert_eq!(flush_reason(&prev, &new), Some("scoped-window-added"));
+    }
+
+    #[test]
+    fn extended_scoped_ban_triggers_flush() {
+        let previous_until = Utc::now() + chrono::Duration::seconds(10);
+        let mut prev = LimitState {
+            last_db_flush_at: Some(Instant::now()),
+            ..Default::default()
+        };
+        set_scoped_ban(&mut prev, "fable", previous_until);
+        let mut new = prev.clone();
+        set_scoped_ban(
+            &mut new,
+            "fable",
+            previous_until + chrono::Duration::seconds(30),
+        );
+
+        assert_eq!(flush_reason(&prev, &new), Some("429-short-ban-scoped"));
+    }
+
+    #[test]
+    fn explicit_null_limits_clear_stale_scoped_windows() {
+        let mut state = LimitState::default();
+        set_scoped_window(
+            &mut state,
+            ScopedLimitSnapshot {
+                model_group: "fable".into(),
+                display_name: "Fable".into(),
+                window: mk_window(0.42),
+            },
+        );
+
+        apply_usage_json(&mut state, &serde_json::json!({"limits": null}));
+
+        assert!(state.scoped_weekly.is_empty());
+    }
+
+    #[test]
+    fn missing_limits_field_preserves_realtime_scoped_window() {
+        let mut state = LimitState::default();
+        set_scoped_window(
+            &mut state,
+            ScopedLimitSnapshot {
+                model_group: "fable".into(),
+                display_name: "Fable".into(),
+                window: mk_window(0.42),
+            },
+        );
+
+        apply_usage_json(&mut state, &serde_json::json!({}));
+
+        assert!(state.scoped_weekly.contains_key("fable"));
+    }
+
+    #[test]
+    fn malformed_dynamic_limits_are_ignored() {
+        let usage = serde_json::json!({
+            "limits": [
+                null,
+                {"type": "monthly_scoped"},
+                {"type": "weekly_scoped", "scope": {"model": {"model_group": ""}}},
+                {
+                    "type": "weekly_scoped",
+                    "scope": {"model": {"model_group": "future-model"}},
+                    "utilization": 7.0,
+                    "resets_at": "2026-08-27T00:00:00Z"
+                }
+            ]
+        });
+        let items = parse_usage_json_scoped_limits(&usage);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].display_name, "Future Model");
+    }
+
+    #[test]
+    fn fable_headers_update_only_fable_availability() {
+        let reset = reset_future_unix();
+        let headers = make_headers(&[
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "0.98"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", &reset),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_overage_included",
+            ),
+            ("anthropic-ratelimit-unified-status", "rejected"),
+        ]);
+        let state = compute_new_state(&LimitState::default(), ModelClass::Fable, 429, &headers)
+            .expect("state");
+
+        assert!(
+            state.status.is_none(),
+            "scoped rejection must not poison account"
+        );
+        assert!(!judge_availability(&state, ModelClass::Fable).is_available());
+        assert!(judge_availability(&state, ModelClass::Sonnet).is_available());
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
+    }
+
+    #[test]
+    fn fable_claim_reset_sets_only_fable_ban() {
+        let reset = reset_future_unix();
+        let headers = make_headers(&[
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_overage_included",
+            ),
+            ("anthropic-ratelimit-unified-reset", &reset),
+            ("anthropic-ratelimit-unified-status", "rejected"),
+        ]);
+        let state = compute_new_state(&LimitState::default(), ModelClass::Fable, 429, &headers)
+            .expect("state");
+
+        assert!(state.rate_limited_until.is_none());
+        assert!(state.scoped_rate_limited_until.contains_key("fable"));
+        assert!(!judge_availability(&state, ModelClass::Fable).is_available());
+        assert!(judge_availability(&state, ModelClass::Sonnet).is_available());
+    }
+
+    #[test]
+    fn previous_account_reset_does_not_suppress_new_fable_retry_after() {
+        let previous = LimitState {
+            reset_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            ..Default::default()
+        };
+        let headers = make_headers(&[
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_overage_included",
+            ),
+            ("retry-after", "30"),
+        ]);
+        let state = compute_new_state(&previous, ModelClass::Fable, 429, &headers).expect("state");
+
+        assert!(state.scoped_rate_limited_until.contains_key("fable"));
+    }
+
+    #[test]
+    fn fable_retry_after_sets_only_fable_ban() {
+        let headers = make_headers(&[
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_overage_included",
+            ),
+            ("retry-after", "30"),
+        ]);
+        let state = compute_new_state(&LimitState::default(), ModelClass::Fable, 429, &headers)
+            .expect("state");
+
+        assert!(state.rate_limited_until.is_none());
+        assert!(state.scoped_rate_limited_until.contains_key("fable"));
+        assert!(!judge_availability(&state, ModelClass::Fable).is_available());
+        assert!(judge_availability(&state, ModelClass::Sonnet).is_available());
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
     }
 }

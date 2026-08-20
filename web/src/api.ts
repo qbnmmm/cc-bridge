@@ -95,10 +95,25 @@ export interface UsageWindow {
   surpassed_threshold?: number
 }
 
+export interface ScopedUsageLimit {
+  type: string
+  scope?: {
+    model?: {
+      model_group?: string
+      display_name?: string
+    }
+  }
+  utilization: number
+  resets_at: string
+  status?: string
+}
+
 export interface UsageData {
   five_hour?: UsageWindow
   seven_day?: UsageWindow
   seven_day_sonnet?: UsageWindow
+  seven_day_fable?: UsageWindow
+  limits?: ScopedUsageLimit[] | null
   /** 数据来源：'headers'（响应头吸取）/ undefined（/api/oauth/usage 旧数据）。 */
   source?: string
   /** 全局状态（所有窗口中最紧张的）。 */
@@ -117,6 +132,8 @@ export interface UsageData {
   rate_limited_until?: string
   /** Sonnet 专属短期 429 ban 截止时刻（只挡 Sonnet）。 */
   sonnet_rate_limited_until?: string
+  /** 模型级短期 429 ban，key 为 model_group。 */
+  scoped_rate_limited_until?: Record<string, string>
 }
 
 export interface ApiToken {

@@ -10,6 +10,7 @@ import UsageTrend from './UsageTrend.vue'
 const {
   filters,
   report,
+  trendBuckets,
   dimensions,
   loading,
   error,
@@ -69,7 +70,7 @@ const {
         <p class="text-sm font-medium text-[#4d483f]">所选范围暂无用量</p>
       </div>
       <template v-else>
-        <UsageTrend :buckets="report.buckets" />
+        <UsageTrend :buckets="trendBuckets" />
         <UsageBreakdown :rows="report.breakdown" :group-by="filters.group_by" />
       </template>
     </template>

@@ -23,7 +23,7 @@ const chartPoints = computed(() => {
       bucket: props.buckets[index],
       index,
       value,
-      x: values.value.length === 1 ? 50 : (index / (values.value.length - 1)) * 100,
+      x: values.value.length === 1 ? 50 : 2 + (index / (values.value.length - 1)) * 96,
       y: 92 - (value / max) * 78,
     }))
 })
@@ -88,7 +88,7 @@ const labels = computed(() => {
     </div>
     <div class="h-64 border-y border-[#e8e2d9] bg-white py-4">
       <div class="relative h-48" @mouseleave="activeIndex = null">
-        <svg viewBox="0 0 100 100" preserveAspectRatio="none" class="h-full w-full" role="img" aria-label="用量趋势">
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" class="pointer-events-none h-full w-full" role="img" aria-label="用量趋势">
           <line v-for="y in [14, 40, 66, 92]" :key="y" x1="0" :y1="y" x2="100" :y2="y" stroke="#ebe6de" stroke-width="0.5" />
           <polyline
             v-if="polylinePoints"
@@ -98,33 +98,24 @@ const labels = computed(() => {
             stroke-width="2"
             vector-effect="non-scaling-stroke"
           />
-          <g v-for="point in chartPoints" :key="point.bucket.key">
-            <circle
-              :cx="point.x"
-              :cy="point.y"
-              r="6"
-              fill="transparent"
-              class="cursor-crosshair outline-none"
-              tabindex="0"
-              role="button"
-              :aria-label="pointAriaLabel(point.bucket)"
-              @mouseenter="activeIndex = point.index"
-              @focus="activeIndex = point.index"
-              @blur="activeIndex = null"
-              @click="activeIndex = point.index"
-            />
-            <circle
-              :cx="point.x"
-              :cy="point.y"
-              :r="activeIndex === point.index ? 3.2 : 2.2"
-              fill="#fff"
-              stroke="#c4704f"
-              stroke-width="1.5"
-              vector-effect="non-scaling-stroke"
-              pointer-events="none"
-            />
-          </g>
         </svg>
+        <button
+          v-for="point in chartPoints"
+          :key="point.bucket.key"
+          type="button"
+          class="absolute size-5 -translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full border-0 bg-transparent p-0 outline-none focus-visible:ring-2 focus-visible:ring-[#c4704f]/30"
+          :style="{ left: `${point.x}%`, top: `${point.y}%` }"
+          :aria-label="pointAriaLabel(point.bucket)"
+          @mouseenter="activeIndex = point.index"
+          @focus="activeIndex = point.index"
+          @blur="activeIndex = null"
+          @click="activeIndex = point.index"
+        >
+          <span
+            class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border-[1.5px] border-[#c4704f] bg-white transition-[width,height]"
+            :class="activeIndex === point.index ? 'size-3' : 'size-2.5'"
+          />
+        </button>
         <div
           v-if="activePoint"
           class="pointer-events-none absolute z-10 w-44 border border-[#d9d2c8] bg-white px-3 py-2 text-xs shadow-lg"

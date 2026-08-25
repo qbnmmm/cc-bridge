@@ -6,6 +6,8 @@ export interface UsageDateRange {
   endDate: string
 }
 
+const MINIMUM_DAILY_TREND_POINTS = 7
+
 const singaporeDateFormatter = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Asia/Singapore',
   year: 'numeric',
@@ -42,6 +44,18 @@ export function usageDateRange(preset: UsageDateShortcut): UsageDateRange {
     case 'last_30_days':
       return { startDate: shiftDate(today, -29), endDate: today }
   }
+}
+
+export function dailyTrendDateRange(range: UsageDateRange): UsageDateRange | null {
+  const start = new Date(`${range.startDate}T00:00:00Z`)
+  const end = new Date(`${range.endDate}T00:00:00Z`)
+  const pointCount = Math.floor((end.getTime() - start.getTime()) / 86_400_000) + 1
+  if (pointCount <= 0 || pointCount >= MINIMUM_DAILY_TREND_POINTS) return null
+
+  const retentionStart = shiftDate(singaporeDate(), -364)
+  const desiredStart = shiftDate(range.startDate, pointCount - MINIMUM_DAILY_TREND_POINTS)
+  const startDate = desiredStart < retentionStart ? retentionStart : desiredStart
+  return startDate === range.startDate ? null : { startDate, endDate: range.endDate }
 }
 
 export function formatNanoUsd(nanoUsd: string, maxFractionDigits = 6): string {

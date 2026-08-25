@@ -3,11 +3,13 @@ import {
   api,
   type UsageDimensions,
   type UsageGranularity,
+  type UsageBucket,
   type UsageGroupBy,
   type UsageQueryParams,
   type UsageReport,
 } from '@/api'
 import {
+  dailyTrendDateRange,
   usageDateRange,
   type UsageDatePreset,
   type UsageDateShortcut,
@@ -22,6 +24,7 @@ export function useUsageReport() {
     group_by: 'model',
   })
   const report = shallowRef<UsageReport | null>(null)
+  const trendBuckets = shallowRef<UsageBucket[]>([])
   const dimensions = shallowRef<UsageDimensions>({ accounts: [], api_tokens: [], models: [] })
   const loading = shallowRef(false)
   const error = shallowRef('')
@@ -50,11 +53,29 @@ export function useUsageReport() {
     controller?.abort()
     const currentController = new AbortController()
     controller = currentController
-    if (clearCurrent) report.value = null
+    if (clearCurrent) {
+      report.value = null
+      trendBuckets.value = []
+    }
     loading.value = true
     error.value = ''
+    const query = { ...filters }
+    const trendRange = query.granularity === 'day'
+      ? dailyTrendDateRange({ startDate: query.start_date, endDate: query.end_date })
+      : null
     try {
-      report.value = await api.getUsage({ ...filters }, currentController.signal)
+      const [nextReport, trendReport] = await Promise.all([
+        api.getUsage(query, currentController.signal),
+        trendRange
+          ? api.getUsage(
+              { ...query, start_date: trendRange.startDate, end_date: trendRange.endDate },
+              currentController.signal,
+            ).catch(() => null)
+          : Promise.resolve(null),
+      ])
+      if (controller !== currentController) return
+      report.value = nextReport
+      trendBuckets.value = trendReport?.buckets ?? nextReport.buckets
     } catch (cause) {
       if ((cause as Error).name !== 'AbortError') {
         error.value = (cause as Error).message || '加载用量失败'
@@ -97,6 +118,7 @@ export function useUsageReport() {
   return {
     filters,
     report,
+    trendBuckets,
     dimensions,
     loading,
     error,

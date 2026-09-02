@@ -16,6 +16,9 @@ use crate::error::AppError;
 use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::account::AccountService;
+use crate::service::fingerprint_audit::{
+    FingerprintAudit, FingerprintMismatch, request_observation,
+};
 use crate::service::rewriter::{
     ClientType, Rewriter, clean_session_id_from_body, detect_client_type,
 };
@@ -104,6 +107,7 @@ pub struct GatewayService {
     telemetry_svc: Arc<TelemetryService>,
     limit_store: Arc<crate::service::limit::LimitStore>,
     usage_svc: Arc<UsageService>,
+    fingerprint_audit: Arc<FingerprintAudit>,
 }
 
 impl GatewayService {
@@ -113,6 +117,7 @@ impl GatewayService {
         telemetry_svc: Arc<TelemetryService>,
         limit_store: Arc<crate::service::limit::LimitStore>,
         usage_svc: Arc<UsageService>,
+        fingerprint_audit: Arc<FingerprintAudit>,
     ) -> Self {
         Self {
             account_svc,
@@ -120,6 +125,7 @@ impl GatewayService {
             telemetry_svc,
             limit_store,
             usage_svc,
+            fingerprint_audit,
         }
     }
 
@@ -143,7 +149,11 @@ impl GatewayService {
         macro_rules! cp {
             ($name:expr) => {
                 let _now = Instant::now();
-                perf_log(&rid, $name, _now.duration_since(t_prev).as_secs_f64() * 1000.0);
+                perf_log(
+                    &rid,
+                    $name,
+                    _now.duration_since(t_prev).as_secs_f64() * 1000.0,
+                );
                 t_prev = _now;
             };
         }
@@ -189,10 +199,7 @@ impl GatewayService {
         };
 
         // 按请求模型选择账号级或模型级限流视图（Sonnet/Fable 有独立周额度）。
-        let model_id_for_class = body_map
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
+        let model_id_for_class = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
         let model_class = crate::service::limit::ModelClass::from_model_id(model_id_for_class);
 
         // 黏性透传策略：429 不再 retry 其它账号（换号会 bust prompt cache，成本爆炸）。
@@ -228,13 +235,6 @@ impl GatewayService {
                 debug!("telemetry: intercepted {} for account {}", path, account.id);
                 return Ok(axum::Json(body).into_response());
             }
-
-            if path.starts_with("/v1/messages") {
-                let model_id = body_map.get("model").and_then(|m| m.as_str()).unwrap_or("");
-                self.telemetry_svc
-                    .activate_session(&account, model_id)
-                    .await;
-            }
         }
 
         // 获取并发槽位
@@ -259,9 +259,9 @@ impl GatewayService {
             "request body BEFORE rewrite: {}",
             truncate_body(&body_bytes, 4096)
         );
-        let rewritten_body =
-            self.rewriter
-                .rewrite_body(&body_bytes, &path, &account, client_type);
+        let rewritten_body = self
+            .rewriter
+            .rewrite_body(&body_bytes, &path, &account, client_type);
         debug!(
             "request body AFTER rewrite: {}",
             truncate_body(&rewritten_body, 4096)
@@ -296,13 +296,40 @@ impl GatewayService {
             .unwrap_or(false);
         cp!("rewrite");
 
-        let upstream_token = self.account_svc.resolve_upstream_token_with(&account).await?;
+        if path.starts_with("/v1/messages") {
+            let audit = build_fingerprint_observation(
+                &account,
+                client_type,
+                &ua,
+                &rewritten_headers,
+                &rewritten_body_map,
+                &final_model,
+                is_stream,
+            );
+            self.fingerprint_audit.observe_request(audit);
+        }
+
+        let upstream_token = self
+            .account_svc
+            .resolve_upstream_token_with(&account)
+            .await?;
+        if path.starts_with("/v1/messages") && account.auto_telemetry {
+            let profile = crate::service::telemetry::TelemetryRequestProfile::from_request(
+                &final_model,
+                &rewritten_headers,
+                &rewritten_body_map,
+                client_type,
+            );
+            self.telemetry_svc
+                .activate_session(&account, upstream_token.clone(), profile)
+                .await;
+        }
         let mut final_headers = rewritten_headers;
         final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
         let usage_attempt = (path == "/v1/messages")
             .then(|| api_token)
             .flatten()
-            .map(|token| UsageAttempt::begin(account.id, token.id, final_model, is_stream));
+            .map(|token| UsageAttempt::begin(account.id, token.id, final_model.clone(), is_stream));
         cp!("resolve_token");
 
         let resp = self
@@ -347,10 +374,7 @@ impl GatewayService {
                 account.id, group
             );
         } else {
-            warn!(
-                "account {} returned 429 (sticky, no retry)",
-                account.id
-            );
+            warn!("account {} returned 429 (sticky, no retry)", account.id);
         }
         Ok(wrap_429_response(resp))
     }
@@ -407,9 +431,15 @@ impl GatewayService {
             warn!("upstream error for account {}: {}", account.id, e);
             AppError::BadGateway("upstream request failed".into())
         })?;
-        perf_log(rid, "upstream_send_ttfb", send_t0.elapsed().as_secs_f64() * 1000.0);
+        perf_log(
+            rid,
+            "upstream_send_ttfb",
+            send_t0.elapsed().as_secs_f64() * 1000.0,
+        );
 
         let status_code = resp.status().as_u16();
+        self.fingerprint_audit
+            .observe_response(account.id, status_code);
         if let Some(attempt) = usage_attempt.as_mut() {
             attempt.is_stream = usage_response_is_stream(resp.headers(), attempt.is_stream);
             attempt.complete_response(
@@ -437,7 +467,9 @@ impl GatewayService {
         // 对空闲 2xx 响应且无 unified-* 字段：无副作用直接 return false。
         // 对 429 响应：即使无 unified-* 字段也会设短期隔离（retry-after 或默认 60s），避免并发请求反复撞同一账号。
         let absorb_t0 = Instant::now();
-        let should_flush = self.limit_store.absorb_headers(account.id, model_class, status_code, resp.headers());
+        let should_flush =
+            self.limit_store
+                .absorb_headers(account.id, model_class, status_code, resp.headers());
         if should_flush {
             let ls = self.limit_store.clone();
             let aid = account.id;
@@ -447,7 +479,11 @@ impl GatewayService {
                 }
             });
         }
-        perf_log(rid, "absorb_headers", absorb_t0.elapsed().as_secs_f64() * 1000.0);
+        perf_log(
+            rid,
+            "absorb_headers",
+            absorb_t0.elapsed().as_secs_f64() * 1000.0,
+        );
 
         // 构建响应
         let mut response_builder = Response::builder()
@@ -486,6 +522,138 @@ impl GatewayService {
             .body(body)
             .map_err(|e| AppError::Internal(format!("build response: {}", e)))
     }
+}
+
+fn map_header<'a>(
+    headers: &'a std::collections::HashMap<String, String>,
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn user_agent_entrypoint(user_agent: &str) -> String {
+    let Some((_, suffix)) = user_agent.split_once("(external, ") else {
+        return "cli".into();
+    };
+    suffix
+        .trim_end_matches(')')
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("cli")
+        .to_string()
+}
+
+fn request_thinking_type(body: &serde_json::Value) -> Option<&str> {
+    body.get("thinking")
+        .and_then(|value| value.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| *value != "disabled")
+}
+
+fn request_effort(body: &serde_json::Value) -> Option<&str> {
+    body.get("output_config")
+        .and_then(|value| value.get("effort"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| body.get("effort").and_then(serde_json::Value::as_str))
+}
+
+fn build_fingerprint_observation(
+    account: &Account,
+    client_type: ClientType,
+    incoming_user_agent: &str,
+    outgoing_headers: &std::collections::HashMap<String, String>,
+    body: &serde_json::Value,
+    model: &str,
+    stream: bool,
+) -> crate::service::fingerprint_audit::AuditRequestObservation {
+    let env = crate::model::identity::parse_canonical_env(&account.canonical_env);
+    let outgoing_user_agent = map_header(outgoing_headers, "user-agent").unwrap_or("");
+    let incoming_entrypoint = user_agent_entrypoint(incoming_user_agent);
+    let outgoing_entrypoint = user_agent_entrypoint(outgoing_user_agent);
+    let betas: Vec<String> = map_header(outgoing_headers, "anthropic-beta")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    let required = crate::service::rewriter::compute_betas_for_request(model, body);
+    let mut mismatches = Vec::new();
+    if env.version != crate::model::identity::CLAUDE_CODE_VERSION
+        || !outgoing_user_agent.contains(crate::model::identity::CLAUDE_CODE_VERSION)
+    {
+        mismatches.push(FingerprintMismatch::Version);
+    }
+    if env.build_time != crate::model::identity::CLAUDE_CODE_BUILD_TIME {
+        mismatches.push(FingerprintMismatch::BuildTime);
+    }
+    if map_header(outgoing_headers, "x-stainless-package-version")
+        != Some(crate::model::identity::CLAUDE_CODE_STAINLESS_VERSION)
+    {
+        mismatches.push(FingerprintMismatch::StainlessPackage);
+    }
+    let expected_os = match env.platform.as_str() {
+        "darwin" => "MacOS",
+        "win32" => "Windows",
+        _ => "Linux",
+    };
+    if map_header(outgoing_headers, "x-stainless-os") != Some(expected_os) {
+        mismatches.push(FingerprintMismatch::StainlessOs);
+    }
+    if map_header(outgoing_headers, "x-stainless-runtime-version")
+        != Some(env.node_version.as_str())
+    {
+        mismatches.push(FingerprintMismatch::RuntimeVersion);
+    }
+    if client_type == ClientType::ClaudeCode && incoming_entrypoint != outgoing_entrypoint {
+        mismatches.push(FingerprintMismatch::UaEntrypoint);
+    }
+    let mut seen = std::collections::HashSet::new();
+    if required
+        .iter()
+        .any(|required| !betas.iter().any(|beta| beta == required))
+        || betas.iter().any(|beta| !seen.insert(beta))
+    {
+        mismatches.push(FingerprintMismatch::Beta);
+    }
+    let thinking = request_thinking_type(body);
+    if thinking.is_some()
+        && !betas
+            .iter()
+            .any(|beta| beta == "thinking-token-count-2026-05-13")
+    {
+        mismatches.push(FingerprintMismatch::Thinking);
+    }
+    let session_id_present = map_header(outgoing_headers, "x-claude-code-session-id").is_some();
+    let client_request_id_present = map_header(outgoing_headers, "x-client-request-id").is_some();
+    if !session_id_present {
+        mismatches.push(FingerprintMismatch::MissingSessionId);
+    }
+    if !client_request_id_present {
+        mismatches.push(FingerprintMismatch::MissingClientRequestId);
+    }
+
+    request_observation(
+        account,
+        match client_type {
+            ClientType::ClaudeCode => "claude_code",
+            ClientType::API => "api",
+        },
+        &outgoing_entrypoint,
+        model,
+        stream,
+        thinking,
+        request_effort(body),
+        betas,
+        session_id_present,
+        client_request_id_present,
+        mismatches,
+    )
 }
 
 fn upstream_request_id(headers: &HeaderMap) -> Option<String> {
@@ -580,9 +748,7 @@ fn wrap_429_response(resp: Response) -> Response {
     builder = builder.header("content-type", "application/json");
     builder
         .body(Body::from(GENERIC_429_BODY))
-        .unwrap_or_else(|_| {
-            (StatusCode::TOO_MANY_REQUESTS, GENERIC_429_BODY).into_response()
-        })
+        .unwrap_or_else(|_| (StatusCode::TOO_MANY_REQUESTS, GENERIC_429_BODY).into_response())
 }
 
 /// 5xx 黏性透传策略：把上游的 500-599 响应包装成 Anthropic 格式的通用 api_error。
@@ -690,10 +856,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(
-            !slot_is_free(&cache, key).await,
-            "acquire 之后槽位应被占用"
-        );
+        assert!(!slot_is_free(&cache, key).await, "acquire 之后槽位应被占用");
 
         let holder = SlotHolder::new(cache.clone(), key.into());
         drop(holder);
@@ -718,10 +881,7 @@ mod tests {
         holder.disarm();
         settle().await;
 
-        assert!(
-            !slot_is_free(&cache, key).await,
-            "disarm 不应触发释放"
-        );
+        assert!(!slot_is_free(&cache, key).await, "disarm 不应触发释放");
         // 兜底清理
         cache.release_slot(key).await;
     }
@@ -792,10 +952,7 @@ mod tests {
 
     impl Stream for ReadyStream {
         type Item = u32;
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             if self.remaining == 0 {
                 Poll::Ready(None)
             } else {
@@ -813,10 +970,7 @@ mod tests {
 
     impl Stream for ChanStream {
         type Item = u32;
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<Option<Self::Item>> {
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             match self.rx.poll_recv(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(None) => Poll::Ready(None),
@@ -873,10 +1027,7 @@ mod tests {
 
         // 读到 None（流耗尽）之前，槽位必须持续被持有
         while wrapper.as_mut().next().await.is_some() {
-            assert!(
-                !slot_is_free(&cache, key).await,
-                "流未结束期间槽位不能释放"
-            );
+            assert!(!slot_is_free(&cache, key).await, "流未结束期间槽位不能释放");
         }
 
         // 这里流已返回 None；但 SlotHolder 仍在 wrapper 里没 drop
@@ -888,10 +1039,7 @@ mod tests {
         drop(wrapper);
         settle().await;
 
-        assert!(
-            slot_is_free(&cache, key).await,
-            "wrapper drop 后槽位应释放"
-        );
+        assert!(slot_is_free(&cache, key).await, "wrapper drop 后槽位应释放");
     }
 
     #[tokio::test]
@@ -994,10 +1142,7 @@ mod tests {
         cache.release_slot(key).await;
         drop(streams);
         settle().await;
-        assert!(
-            slot_is_free(&cache, key).await,
-            "全部流 drop 后槽位应归零"
-        );
+        assert!(slot_is_free(&cache, key).await, "全部流 drop 后槽位应归零");
     }
 
     /// 验证 pin_project 的透明性 + 异步 poll 行为：使用 ChanStream 让 poll_next
@@ -1138,10 +1283,7 @@ mod tests {
         );
 
         headers.insert("content-encoding", "GZip".parse().unwrap());
-        assert_eq!(
-            usage_content_encoding(&headers),
-            UsageContentEncoding::Gzip
-        );
+        assert_eq!(usage_content_encoding(&headers), UsageContentEncoding::Gzip);
 
         headers.insert("content-encoding", "gzip, br".parse().unwrap());
         assert_eq!(
@@ -1184,11 +1326,7 @@ mod tests {
             "应是通用文案: {}",
             text
         );
-        assert!(
-            !text.contains("Sonnet"),
-            "不应泄漏原 body 细节: {}",
-            text
-        );
+        assert!(!text.contains("Sonnet"), "不应泄漏原 body 细节: {}", text);
     }
 
     #[tokio::test]
@@ -1203,7 +1341,12 @@ mod tests {
             b"<html>rate limited</html>",
         );
         let wrapped = wrap_429_response(original);
-        let ct = wrapped.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = wrapped
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(ct, "application/json");
         // content-length 原值不应存在（axum 会按实际 body 重算或不设）
         let cl_values: Vec<_> = wrapped.headers().get_all("content-length").iter().collect();
@@ -1226,11 +1369,17 @@ mod tests {
         );
         let wrapped = wrap_429_response(original);
         assert_eq!(
-            wrapped.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("60")
         );
         assert_eq!(
-            wrapped.headers().get("x-custom-debug").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("x-custom-debug")
+                .and_then(|v| v.to_str().ok()),
             Some("abc")
         );
         // anthropic-ratelimit-* 默认也保留（用户明确选了"body only"包装，不动 header）
@@ -1264,7 +1413,11 @@ mod tests {
         assert_eq!(wrapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = to_bytes(wrapped.into_body(), 4096).await.unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(text.contains("api_error"), "应包含 api_error type: {}", text);
+        assert!(
+            text.contains("api_error"),
+            "应包含 api_error type: {}",
+            text
+        );
         assert!(text.contains("Upstream error"), "应是通用文案: {}", text);
         assert!(!text.contains("Traceback"), "不应泄漏堆栈: {}", text);
         assert!(!text.contains("core.py"), "不应泄漏内部路径: {}", text);
@@ -1306,26 +1459,31 @@ mod tests {
             "via",
             "content-encoding",
         ] {
-            assert!(
-                wrapped.headers().get(h).is_none(),
-                "header {} 应被剥离",
-                h
-            );
+            assert!(wrapped.headers().get(h).is_none(), "header {} 应被剥离", h);
         }
 
         // 其它非追踪 header 应保留
         assert_eq!(
-            wrapped.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("30")
         );
         assert_eq!(
-            wrapped.headers().get("x-custom-debug").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("x-custom-debug")
+                .and_then(|v| v.to_str().ok()),
             Some("keep-me")
         );
 
         // content-type 应是 application/json
         assert_eq!(
-            wrapped.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            wrapped
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
     }

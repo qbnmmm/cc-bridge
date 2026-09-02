@@ -9,6 +9,7 @@ pub struct Config {
     pub admin: AdminConfig,
     pub log_level: String,
     pub log_dir: String,
+    pub fingerprint_audit_enabled: bool,
     pub usage_pricing_overrides_json: Option<String>,
 }
 
@@ -131,6 +132,12 @@ impl Config {
             log_dir: env_var("LOG_DIR")
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "data/logs".into()),
+            fingerprint_audit_enabled: env_var("FINGERPRINT_AUDIT_ENABLED").is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }),
             usage_pricing_overrides_json: env_var("USAGE_PRICING_OVERRIDES_JSON")
                 .filter(|value| !value.trim().is_empty()),
         }

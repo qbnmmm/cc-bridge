@@ -46,15 +46,10 @@ impl TokenTester {
         proxy_url: &str,
         canonical_env: &Value,
     ) -> Result<(), AppError> {
-        let env: CanonicalEnvData =
-            serde_json::from_value(canonical_env.clone()).unwrap_or_default();
-        let version = if env.version.is_empty() {
-            "2.1.81"
-        } else {
-            &env.version
-        };
+        let env: CanonicalEnvData = crate::model::identity::parse_canonical_env(canonical_env);
+        let version = &env.version;
         let stainless_os = match env.platform.as_str() {
-            "darwin" => "Mac OS X",
+            "darwin" => "MacOS",
             "win32" => "Windows",
             _ => "Linux",
         };
@@ -65,6 +60,11 @@ impl TokenTester {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
+        let beta =
+            crate::service::rewriter::compute_betas_for_request("claude-haiku-4-5-20251001", &body)
+                .join(",");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let request_id = uuid::Uuid::new_v4().to_string();
         let client = make_request_client(proxy_url);
 
         let resp = client
@@ -73,19 +73,27 @@ impl TokenTester {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05")
+            .header("anthropic-beta", beta)
             .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("User-Agent", format!("claude-cli/{} (external, cli)", version))
+            .header(
+                "User-Agent",
+                format!("claude-cli/{} (external, cli)", version),
+            )
             .header("x-app", "cli")
             .header("accept-encoding", "gzip, deflate, br, zstd")
             .header("X-Stainless-Lang", "js")
-            .header("X-Stainless-Package-Version", "0.70.0")
+            .header(
+                "X-Stainless-Package-Version",
+                crate::model::identity::CLAUDE_CODE_STAINLESS_VERSION,
+            )
             .header("X-Stainless-OS", stainless_os)
             .header("X-Stainless-Arch", &env.arch)
             .header("X-Stainless-Runtime", "node")
             .header("X-Stainless-Runtime-Version", &env.node_version)
             .header("X-Stainless-Retry-Count", "0")
             .header("X-Stainless-Timeout", "600")
+            .header("X-Claude-Code-Session-Id", session_id)
+            .header("x-client-request-id", request_id)
             .json(&body)
             .send()
             .await
@@ -166,7 +174,13 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("User-Agent", "claude-code/2.1.81")
+        .header(
+            "User-Agent",
+            format!(
+                "claude-code/{}",
+                crate::model::identity::CLAUDE_CODE_VERSION
+            ),
+        )
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("usage request failed: {}", e)))?;

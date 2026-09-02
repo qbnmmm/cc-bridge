@@ -106,3 +106,52 @@
 Wrong：根据请求成本 ledger 反推 quota，或缺少 scoped 数据时显示固定 0%。
 
 Correct：只使用 OAuth usage/实时 rate-limit 数据，并按实际存在的 model group 判定和展示。
+
+## Scenario: Claude Code release profile alignment
+
+### 1. Scope / Trigger
+
+- Trigger: changing the emulated Claude Code release, request headers, beta selection, canonical env or automatic telemetry profile.
+- Current verified darwin arm64 baseline: Claude Code `2.1.258`, build `2026-09-01T21:54:40Z`, Stainless `0.112.1`, runtime `node/v26.3.0`, Stainless OS `MacOS`.
+
+### 2. Signatures
+
+- Authoritative constants: `src/model/identity.rs::{CLAUDE_CODE_VERSION, CLAUDE_CODE_BUILD_TIME, CLAUDE_CODE_STAINLESS_VERSION, CLAUDE_CODE_RUNTIME_VERSION}`.
+- Runtime normalization: `normalize_canonical_env_json(&mut Value)` and `parse_canonical_env(&Value)`.
+- Request-aware beta selection: `compute_betas_for_request(model_id, body)`.
+- Existing-account persistence: account rows normalize on read; `AccountStore::update` persists normalized `canonical_env` when the account is edited.
+
+### 3. Contracts
+
+- Incoming Claude Code UA keeps its suffix/entrypoint and only replaces the release token: `sdk-cli`, `cli` and Agent SDK metadata must not collapse to one value.
+- First-party outbound requests always have normalized Stainless version/OS/runtime plus `X-Claude-Code-Session-Id` and `x-client-request-id`.
+- Incoming beta order is preserved; missing bridge-required auth/first-party beta values append without duplicates.
+- Beta selection uses both model and body: thinking adds thinking-token-count; effort can add mid-conversation/effort; Claude 4.5 Haiku keeps `claude-code-20250219`; legacy Claude 3 Haiku does not.
+- `redact-thinking-2026-02-12` is not added by default without a current request condition or incoming value.
+- Existing account platform, arch, terminal, package managers, device ID and process ranges survive release normalization.
+
+### 4. Validation & Error Matrix
+
+- Missing/partial `canonical_env` -> fill release-bound defaults, retain unknown JSON keys, do not fail account load.
+- Unknown incoming beta -> retain after known required beta values; invalid audit values are normalized to `other`.
+- Missing first-party request/session ID -> generate before forwarding and report an audit anomaly if still absent.
+- No direct ClientHello/JA3/JA4 evidence -> do not modify craftls or the product TLS fingerprint.
+
+### 5. Good/Base/Bad Cases
+
+- Good: `claude-cli/2.1.81 (external, sdk-cli)` becomes `claude-cli/2.1.258 (external, sdk-cli)` with Stainless `0.112.1` and body-aware beta values.
+- Base: a generic API request receives the canonical CLI header set and generated request/session IDs.
+- Bad: updating only the UA version while leaving `canonical_env=2.1.81`, Stainless `0.70.0`, or forcing every entrypoint to `cli`.
+
+### 6. Tests Required
+
+- Release normalization preserves unknown/non-release fields and persists on account edit.
+- Header tests cover UA suffix preservation, Stainless values and generated first-party IDs.
+- Beta tests cover Sonnet thinking+effort, Claude 4.5 Haiku order, legacy Claude 3 and `[1m]`.
+- Telemetry tests assert request entrypoint/thinking/effort and env/metrics release consistency.
+
+### 7. Wrong vs Correct
+
+Wrong: independently hard-code a version or Stainless value in `oauth.rs`, `rewriter.rs` or `telemetry.rs`.
+
+Correct: use the identity-owned release constants and endpoint-specific formatting/selection logic.

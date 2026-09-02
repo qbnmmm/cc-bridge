@@ -4,34 +4,54 @@ use std::collections::HashMap;
 
 use super::account::{CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData};
 
+pub const CLAUDE_CODE_VERSION: &str = "2.1.258";
+pub const CLAUDE_CODE_BUILD_TIME: &str = "2026-09-01T21:54:40Z";
+pub const CLAUDE_CODE_STAINLESS_VERSION: &str = "0.112.1";
+pub const CLAUDE_CODE_RUNTIME_VERSION: &str = "v26.3.0";
+
 fn env_presets() -> Vec<CanonicalEnvData> {
     vec![
         // --- darwin arm64 (8 presets) ---
-        dp("arm64", "v22.15.0", "iTerm.app", "npm,pnpm"),
-        dp("arm64", "v24.3.0", "Apple_Terminal", "npm,yarn"),
-        dp("arm64", "v22.15.0", "vscode", "npm,pnpm"),
-        dp("arm64", "v24.3.0", "WarpTerminal", "npm"),
-        dp("arm64", "v22.15.0", "kitty", "npm,yarn,pnpm"),
-        dp("arm64", "v24.3.0", "iTerm.app", "npm"),
-        dp("arm64", "v22.15.0", "tmux", "npm,pnpm"),
-        dp("arm64", "v24.3.0", "ghostty", "npm,yarn"),
+        dp(
+            "arm64",
+            CLAUDE_CODE_RUNTIME_VERSION,
+            "iTerm.app",
+            "npm,pnpm",
+        ),
+        dp(
+            "arm64",
+            CLAUDE_CODE_RUNTIME_VERSION,
+            "Apple_Terminal",
+            "npm,yarn",
+        ),
+        dp("arm64", CLAUDE_CODE_RUNTIME_VERSION, "vscode", "npm,pnpm"),
+        dp("arm64", CLAUDE_CODE_RUNTIME_VERSION, "WarpTerminal", "npm"),
+        dp(
+            "arm64",
+            CLAUDE_CODE_RUNTIME_VERSION,
+            "kitty",
+            "npm,yarn,pnpm",
+        ),
+        dp("arm64", CLAUDE_CODE_RUNTIME_VERSION, "iTerm.app", "npm"),
+        dp("arm64", CLAUDE_CODE_RUNTIME_VERSION, "tmux", "npm,pnpm"),
+        dp("arm64", CLAUDE_CODE_RUNTIME_VERSION, "ghostty", "npm,yarn"),
         // --- darwin x64 (4 presets) ---
-        dx("v22.15.0", "iTerm.app", "npm,yarn"),
-        dx("v24.3.0", "Apple_Terminal", "npm,pnpm"),
-        dx("v22.15.0", "vscode", "npm"),
-        dx("v24.3.0", "iTerm.app", "npm,pnpm"),
+        dx(CLAUDE_CODE_RUNTIME_VERSION, "iTerm.app", "npm,yarn"),
+        dx(CLAUDE_CODE_RUNTIME_VERSION, "Apple_Terminal", "npm,pnpm"),
+        dx(CLAUDE_CODE_RUNTIME_VERSION, "vscode", "npm"),
+        dx(CLAUDE_CODE_RUNTIME_VERSION, "iTerm.app", "npm,pnpm"),
         // --- linux (6 presets) ---
-        lp("v22.15.0", "gnome-terminal", "npm,pnpm"),
-        lp("v24.3.0", "ssh-session", "npm"),
-        lp("v22.15.0", "xterm-256color", "npm,yarn"),
-        lp("v24.3.0", "vscode", "npm,pnpm"),
-        lp("v22.15.0", "tmux", "npm"),
-        lp("v24.3.0", "alacritty", "npm,yarn"),
+        lp(CLAUDE_CODE_RUNTIME_VERSION, "gnome-terminal", "npm,pnpm"),
+        lp(CLAUDE_CODE_RUNTIME_VERSION, "ssh-session", "npm"),
+        lp(CLAUDE_CODE_RUNTIME_VERSION, "xterm-256color", "npm,yarn"),
+        lp(CLAUDE_CODE_RUNTIME_VERSION, "vscode", "npm,pnpm"),
+        lp(CLAUDE_CODE_RUNTIME_VERSION, "tmux", "npm"),
+        lp(CLAUDE_CODE_RUNTIME_VERSION, "alacritty", "npm,yarn"),
         // --- win32 (4 presets) ---
-        wp("v22.15.0", "windows-terminal", "npm,pnpm"),
-        wp("v24.3.0", "vscode", "npm,yarn"),
-        wp("v22.15.0", "mingw64", "npm"),
-        wp("v24.3.0", "windows-terminal", "npm,pnpm"),
+        wp(CLAUDE_CODE_RUNTIME_VERSION, "windows-terminal", "npm,pnpm"),
+        wp(CLAUDE_CODE_RUNTIME_VERSION, "vscode", "npm,yarn"),
+        wp(CLAUDE_CODE_RUNTIME_VERSION, "mingw64", "npm"),
+        wp(CLAUDE_CODE_RUNTIME_VERSION, "windows-terminal", "npm,pnpm"),
     ]
 }
 
@@ -42,12 +62,14 @@ fn dp(arch: &str, node: &str, term: &str, pm: &str) -> CanonicalEnvData {
         arch: arch.into(),
         node_version: node.into(),
         terminal: term.into(),
+        shell: "zsh".into(),
         package_managers: pm.into(),
         runtimes: "node".into(),
+        is_running_with_bun: true,
         is_claude_ai_auth: true,
-        version: "2.1.81".into(),
-        version_base: "2.1.81".into(),
-        build_time: "2026-03-20T21:26:18Z".into(),
+        version: CLAUDE_CODE_VERSION.into(),
+        version_base: CLAUDE_CODE_VERSION.into(),
+        build_time: CLAUDE_CODE_BUILD_TIME.into(),
         deployment_environment: "unknown-darwin".into(),
         vcs: "git".into(),
         ..Default::default()
@@ -65,12 +87,14 @@ fn lp(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
         arch: "x64".into(),
         node_version: node.into(),
         terminal: term.into(),
+        shell: "bash".into(),
         package_managers: pm.into(),
         runtimes: "node".into(),
+        is_running_with_bun: true,
         is_claude_ai_auth: true,
-        version: "2.1.81".into(),
-        version_base: "2.1.81".into(),
-        build_time: "2026-03-20T21:26:18Z".into(),
+        version: CLAUDE_CODE_VERSION.into(),
+        version_base: CLAUDE_CODE_VERSION.into(),
+        build_time: CLAUDE_CODE_BUILD_TIME.into(),
         deployment_environment: "unknown-linux".into(),
         vcs: "git".into(),
         ..Default::default()
@@ -84,12 +108,14 @@ fn wp(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
         arch: "x64".into(),
         node_version: node.into(),
         terminal: term.into(),
+        shell: "bash".into(),
         package_managers: pm.into(),
         runtimes: "node".into(),
+        is_running_with_bun: true,
         is_claude_ai_auth: true,
-        version: "2.1.81".into(),
-        version_base: "2.1.81".into(),
-        build_time: "2026-03-20T21:26:18Z".into(),
+        version: CLAUDE_CODE_VERSION.into(),
+        version_base: CLAUDE_CODE_VERSION.into(),
+        build_time: CLAUDE_CODE_BUILD_TIME.into(),
         deployment_environment: "unknown-win32".into(),
         vcs: "git".into(),
         ..Default::default()
@@ -168,43 +194,127 @@ pub fn generate_canonical_identity() -> (String, Value, Value, Value) {
     (device_id, env_json, prompt_json, process_json)
 }
 
+/// 将持久化环境中的版本绑定字段规范化到当前客户端 release profile。
+/// 直接修改 JSON object，保留未来版本或手工写入的未知字段。
+pub fn normalize_canonical_env_json(value: &mut Value) {
+    if !value.is_object() {
+        *value = Value::Object(Default::default());
+    }
+    let map = value.as_object_mut().expect("canonical env object");
+    map.insert("version".into(), Value::String(CLAUDE_CODE_VERSION.into()));
+    map.insert(
+        "version_base".into(),
+        Value::String(CLAUDE_CODE_VERSION.into()),
+    );
+    map.insert(
+        "build_time".into(),
+        Value::String(CLAUDE_CODE_BUILD_TIME.into()),
+    );
+    map.insert(
+        "node_version".into(),
+        Value::String(CLAUDE_CODE_RUNTIME_VERSION.into()),
+    );
+    map.insert("runtimes".into(), Value::String("node".into()));
+    map.insert("is_running_with_bun".into(), Value::Bool(true));
+
+    let shell = match map.get("platform").and_then(Value::as_str) {
+        Some("darwin") => "zsh",
+        Some("linux" | "win32") => "bash",
+        _ => "",
+    };
+    if !shell.is_empty()
+        && !map
+            .get("shell")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    {
+        map.insert("shell".into(), Value::String(shell.into()));
+    }
+}
+
+pub fn parse_canonical_env(value: &Value) -> CanonicalEnvData {
+    let mut normalized = value.clone();
+    normalize_canonical_env_json(&mut normalized);
+    serde_json::from_value(normalized).unwrap_or_default()
+}
+
 /// 构造 proto schema 完整的 env JSON（含所有 ~30 个字段）。
 /// 供 rewriter 和 telemetry 共用，避免重复定义。
 pub fn build_full_env_json(env: &CanonicalEnvData) -> Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "platform": env.platform,
         "platform_raw": env.platform_raw,
         "arch": env.arch,
         "node_version": env.node_version,
-        "terminal": env.terminal,
+        "terminal": if env.terminal.is_empty() { "unknown" } else { &env.terminal },
+        "shell": env.shell,
         "package_managers": env.package_managers,
         "runtimes": env.runtimes,
-        "is_running_with_bun": false,
-        "is_ci": false,
-        "is_claubbit": false,
-        "is_claude_code_remote": false,
-        "is_local_agent_mode": false,
-        "is_conductor": false,
-        "is_github_action": false,
-        "is_claude_code_action": false,
+        "is_running_with_bun": env.is_running_with_bun,
+        "is_ci": env.is_ci,
+        "is_claubbit": env.is_claubbit,
+        "is_claude_code_remote": env.is_claude_code_remote,
+        "is_local_agent_mode": env.is_local_agent_mode,
+        "is_conductor": env.is_conductor,
+        "is_github_action": env.is_github_action,
+        "is_claude_code_action": env.is_claude_code_action,
         "is_claude_ai_auth": env.is_claude_ai_auth,
         "version": env.version,
         "version_base": env.version_base,
         "build_time": env.build_time,
         "deployment_environment": env.deployment_environment,
         "vcs": env.vcs,
-        "github_event_name": "",
-        "github_actions_runner_environment": "",
-        "github_actions_runner_os": "",
-        "github_action_ref": "",
-        "wsl_version": "",
-        "remote_environment_type": "",
-        "claude_code_container_id": "",
-        "claude_code_remote_session_id": "",
-        "tags": [],
-        "coworker_type": "",
-        "linux_distro_id": "",
-        "linux_distro_version": "",
-        "linux_kernel": "",
-    })
+    });
+    let map = value.as_object_mut().expect("full env object");
+    map.retain(|_, item| !matches!(item, Value::String(text) if text.is_empty()));
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalization_updates_release_fields_and_preserves_identity_fields() {
+        let mut value = serde_json::json!({
+            "platform": "darwin",
+            "arch": "arm64",
+            "terminal": "iTerm.app",
+            "package_managers": "npm,pnpm",
+            "version": "2.1.81",
+            "build_time": "old",
+            "future_field": {"enabled": true}
+        });
+        normalize_canonical_env_json(&mut value);
+        assert_eq!(value["version"], CLAUDE_CODE_VERSION);
+        assert_eq!(value["version_base"], CLAUDE_CODE_VERSION);
+        assert_eq!(value["build_time"], CLAUDE_CODE_BUILD_TIME);
+        assert_eq!(value["node_version"], CLAUDE_CODE_RUNTIME_VERSION);
+        assert_eq!(value["terminal"], "iTerm.app");
+        assert_eq!(value["package_managers"], "npm,pnpm");
+        assert_eq!(value["future_field"]["enabled"], true);
+    }
+
+    #[test]
+    fn full_env_uses_bun_shell_and_omits_empty_optional_values() {
+        let env = CanonicalEnvData {
+            platform: "darwin".into(),
+            platform_raw: "darwin".into(),
+            arch: "arm64".into(),
+            node_version: CLAUDE_CODE_RUNTIME_VERSION.into(),
+            terminal: "iTerm.app".into(),
+            shell: "zsh".into(),
+            package_managers: "npm".into(),
+            runtimes: "node".into(),
+            is_running_with_bun: true,
+            version: CLAUDE_CODE_VERSION.into(),
+            version_base: CLAUDE_CODE_VERSION.into(),
+            build_time: CLAUDE_CODE_BUILD_TIME.into(),
+            ..Default::default()
+        };
+        let value = build_full_env_json(&env);
+        assert_eq!(value["is_running_with_bun"], true);
+        assert_eq!(value["shell"], "zsh");
+        assert!(value.get("remote_environment_type").is_none());
+    }
 }

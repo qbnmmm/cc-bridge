@@ -10,7 +10,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::model::account::{Account, CanonicalEnvData, CanonicalProcessData};
-use crate::service::account::AccountService;
+use crate::service::fingerprint_audit::FingerprintAudit;
+use crate::service::rewriter::ClientType;
 use crate::store::account_store::AccountStore;
 
 // ---------------------------------------------------------------------------
@@ -63,8 +64,8 @@ struct TelemetrySession {
     last_metrics_at: Instant,
     send_count: i64,
     running: bool,
-    /// 最近一次 /v1/messages 使用的模型 ID — 用于 tengu_api_success 的 model 字段。
-    last_model: String,
+    /// 最近一次 /v1/messages 的真实请求画像，用于构造一致的 query/success telemetry。
+    request_profile: TelemetryRequestProfile,
     /// 累积 CPU 用户态微秒数（模拟 process.cpuUsage().user，严格单调递增）。
     cpu_user_total: i64,
     /// 累积 CPU 系统态微秒数（模拟 process.cpuUsage().system）。
@@ -101,19 +102,81 @@ struct TelemetrySession {
 // TelemetryService
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+pub struct TelemetryRequestProfile {
+    pub model: String,
+    pub betas: String,
+    pub entrypoint: String,
+    pub client_type: String,
+    pub is_interactive: bool,
+    pub thinking_type: Option<String>,
+    pub effort: Option<String>,
+    pub fast_mode: bool,
+}
+
+impl TelemetryRequestProfile {
+    pub fn from_request(
+        model: &str,
+        headers: &HashMap<String, String>,
+        body: &serde_json::Value,
+        _client_type: ClientType,
+    ) -> Self {
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        let user_agent = header("user-agent").unwrap_or("");
+        let entrypoint = user_agent
+            .split_once("(external, ")
+            .and_then(|(_, suffix)| suffix.trim_end_matches(')').split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("cli")
+            .to_string();
+        let thinking_type = body
+            .get("thinking")
+            .and_then(|value| value.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| *value != "disabled")
+            .map(str::to_string);
+        let effort = body
+            .get("output_config")
+            .and_then(|value| value.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| body.get("effort").and_then(serde_json::Value::as_str))
+            .map(str::to_string);
+        Self {
+            model: model.to_string(),
+            betas: header("anthropic-beta").unwrap_or("").to_string(),
+            is_interactive: entrypoint == "cli",
+            entrypoint,
+            client_type: "cli".into(),
+            thinking_type,
+            effort,
+            fast_mode: header("anthropic-beta").is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|beta| beta.trim() == "fast-mode-2026-02-01")
+            }),
+        }
+    }
+}
+
 /// 管理自动遥测会话的后台服务。
 pub struct TelemetryService {
     sessions: Arc<Mutex<HashMap<i64, TelemetrySession>>>,
     account_store: Arc<AccountStore>,
-    account_svc: Arc<AccountService>,
+    fingerprint_audit: Arc<FingerprintAudit>,
 }
 
 impl TelemetryService {
-    pub fn new(account_store: Arc<AccountStore>, account_svc: Arc<AccountService>) -> Self {
+    pub fn new(account_store: Arc<AccountStore>, fingerprint_audit: Arc<FingerprintAudit>) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             account_store,
-            account_svc,
+            fingerprint_audit,
         }
     }
 
@@ -124,23 +187,16 @@ impl TelemetryService {
     }
 
     /// 当 /v1/messages 请求到来时调用，激活或续期遥测会话。
-    /// `model_id` 为本次请求的模型（供后续 tengu_api_success 事件使用）；
     /// 同时每次调用都会把 pending_events += 1，让 telemetry_loop 驱动事件发送。
-    pub async fn activate_session(&self, account: &Account, model_id: &str) {
+    pub async fn activate_session(
+        &self,
+        account: &Account,
+        token: String,
+        request_profile: TelemetryRequestProfile,
+    ) {
         if !account.auto_telemetry {
             return;
         }
-
-        let token = match self.account_svc.resolve_upstream_token_with(account).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(
-                    "telemetry: cannot resolve token for account {}: {}",
-                    account.id, e
-                );
-                return;
-            }
-        };
 
         let mut sessions = self.sessions.lock().await;
         let now = Instant::now();
@@ -151,9 +207,7 @@ impl TelemetryService {
             session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
             session.token = token;
             session.account = account.clone();
-            if !model_id.is_empty() {
-                session.last_model = model_id.to_string();
-            }
+            session.request_profile = request_profile;
             session.pending_events = session.pending_events.saturating_add(1);
             debug!("telemetry: renewed session for account {}", account.id);
             return;
@@ -161,10 +215,14 @@ impl TelemetryService {
 
         // 新建会话
         info!("telemetry: starting session for account {}", account.id);
-        let resolved_model = if model_id.is_empty() {
-            "claude-sonnet-4-5-20250929".to_string()
+        self.fingerprint_audit.observe_session(account, "started");
+        let request_profile = if request_profile.model.is_empty() {
+            TelemetryRequestProfile {
+                model: "claude-sonnet-5".into(),
+                ..request_profile
+            }
         } else {
-            model_id.to_string()
+            request_profile
         };
 
         // 初始化内存基线（从账号 preset 的区间随机取一个点作为起点）
@@ -196,7 +254,7 @@ impl TelemetryService {
             last_metrics_at: now - METRICS_INTERVAL,
             send_count: 0,
             running: true,
-            last_model: resolved_model,
+            request_profile,
             cpu_user_total: 0,
             cpu_system_total: 0,
             last_cpu_update: now,
@@ -217,11 +275,12 @@ impl TelemetryService {
         // 启动后台任务
         let sessions_ref = self.sessions.clone();
         let store_ref = self.account_store.clone();
+        let audit_ref = self.fingerprint_audit.clone();
         let account_id = account.id;
         let proxy_url = account.proxy_url.clone();
 
         tokio::spawn(async move {
-            telemetry_loop(sessions_ref, store_ref, account_id, proxy_url).await;
+            telemetry_loop(sessions_ref, store_ref, audit_ref, account_id, proxy_url).await;
         });
     }
 }
@@ -233,6 +292,7 @@ impl TelemetryService {
 async fn telemetry_loop(
     sessions: Arc<Mutex<HashMap<i64, TelemetrySession>>>,
     store: Arc<AccountStore>,
+    fingerprint_audit: Arc<FingerprintAudit>,
     account_id: i64,
     proxy_url: String,
 ) {
@@ -250,12 +310,11 @@ async fn telemetry_loop(
         // TTL 过期 → 持久化计数并退出
         if Instant::now() >= session.expires_at {
             let count = session.send_count;
+            let account = session.account.clone();
             session.running = false;
             map.remove(&account_id);
             drop(map);
-            if count > 0 {
-                let _ = store.increment_telemetry_count(account_id, count).await;
-            }
+            fingerprint_audit.observe_session(&account, "expired");
             info!(
                 "telemetry: session expired for account {}, sent {} requests",
                 account_id, count
@@ -272,19 +331,17 @@ async fn telemetry_loop(
             && now >= session.next_event_allowed_at
         {
             // uptime 对标 process.uptime()：从 "进程启动" 算起，而非从首次 API 调用算起
-            let uptime_secs = session.uptime_offset_secs
-                + now.duration_since(session.started_at).as_secs_f64();
+            let uptime_secs =
+                session.uptime_offset_secs + now.duration_since(session.started_at).as_secs_f64();
             // 更新累积 CPU 指标（模拟 process.cpuUsage 单调递增）
             let wall_delta_ms = now.duration_since(session.last_cpu_update).as_millis() as i64;
             // 限定 rng 作用域：避免 ThreadRng (非 Send) 跨 .await
             let (user_delta, system_delta, jitter_secs, mem_drifts) = {
                 let mut rng = rand::thread_rng();
-                let u = rng.gen_range(
-                    (wall_delta_ms.max(1) * 5)..=(wall_delta_ms.max(1) * 30).max(1),
-                );
-                let s = rng.gen_range(
-                    (wall_delta_ms.max(1) * 2)..=(wall_delta_ms.max(1) * 10).max(1),
-                );
+                let u =
+                    rng.gen_range((wall_delta_ms.max(1) * 5)..=(wall_delta_ms.max(1) * 30).max(1));
+                let s =
+                    rng.gen_range((wall_delta_ms.max(1) * 2)..=(wall_delta_ms.max(1) * 10).max(1));
                 let j = rng.gen_range(3u64..=12);
                 // 每个内存字段 ±3% 漂移（对标 process.memoryUsage() 的自然漂移）
                 let mut drift = || rng.gen_range(-0.03f64..=0.03f64);
@@ -333,7 +390,7 @@ async fn telemetry_loop(
             let payload = build_event_batch(EventBatchCtx {
                 account: &session.account,
                 uptime_secs,
-                model: &session.last_model,
+                profile: session.request_profile.clone(),
                 cpu_user_total: session.cpu_user_total,
                 cpu_system_total: session.cpu_system_total,
                 cpu_percent,
@@ -360,7 +417,7 @@ async fn telemetry_loop(
             session.next_event_allowed_at = now + Duration::from_secs(jitter_secs);
             drop(map);
 
-            send_telemetry(
+            let success = send_telemetry(
                 &c,
                 &format!("{}/api/event_logging/batch", UPSTREAM_BASE),
                 &token,
@@ -368,8 +425,10 @@ async fn telemetry_loop(
                 &session_ua(&store, account_id).await,
             )
             .await;
-
-            let _ = store.increment_telemetry_count(account_id, 1).await;
+            fingerprint_audit.observe_telemetry(account_id, "event_batch", success);
+            if success {
+                let _ = store.increment_telemetry_count(account_id, 1).await;
+            }
             continue;
         }
 
@@ -386,7 +445,7 @@ async fn telemetry_loop(
             session.send_count += 1;
             drop(map);
 
-            send_telemetry(
+            let success = send_telemetry(
                 &c,
                 &format!("{}/api/eval/{}", UPSTREAM_BASE, GROWTHBOOK_CLIENT_KEY),
                 &token,
@@ -394,8 +453,10 @@ async fn telemetry_loop(
                 &session_ua(&store, account_id).await,
             )
             .await;
-
-            let _ = store.increment_telemetry_count(account_id, 1).await;
+            fingerprint_audit.observe_telemetry(account_id, "growthbook_eval", success);
+            if success {
+                let _ = store.increment_telemetry_count(account_id, 1).await;
+            }
             continue;
         }
 
@@ -423,7 +484,7 @@ async fn telemetry_loop(
             session.send_count += 1;
             drop(map);
 
-            send_telemetry(
+            let success = send_telemetry(
                 &c,
                 &format!("{}/api/claude_code/metrics", UPSTREAM_BASE),
                 &token,
@@ -431,8 +492,10 @@ async fn telemetry_loop(
                 &session_ua(&store, account_id).await,
             )
             .await;
-
-            let _ = store.increment_telemetry_count(account_id, 1).await;
+            fingerprint_audit.observe_telemetry(account_id, "metrics", success);
+            if success {
+                let _ = store.increment_telemetry_count(account_id, 1).await;
+            }
             continue;
         }
 
@@ -448,7 +511,7 @@ async fn session_ua(store: &Arc<AccountStore>, account_id: i64) -> String {
         .ok()
         .and_then(|a| serde_json::from_value::<CanonicalEnvData>(a.canonical_env).ok())
         .map(|e| e.version)
-        .unwrap_or_else(|| "2.1.81".into());
+        .unwrap_or_else(|| crate::model::identity::CLAUDE_CODE_VERSION.into());
     format!("claude-code/{}", version)
 }
 
@@ -462,7 +525,7 @@ async fn send_telemetry(
     token: &str,
     body: &serde_json::Value,
     user_agent: &str,
-) {
+) -> bool {
     let result = client
         .post(url)
         .header("Content-Type", "application/json")
@@ -479,13 +542,16 @@ async fn send_telemetry(
             let status = resp.status();
             if status.is_success() {
                 debug!("telemetry: {} → {}", url, status);
+                true
             } else {
                 let text = resp.text().await.unwrap_or_default();
                 warn!("telemetry: {} → {} {}", url, status, text);
+                false
             }
         }
         Err(e) => {
             warn!("telemetry: {} failed: {}", url, e);
+            false
         }
     }
 }
@@ -495,7 +561,7 @@ async fn send_telemetry(
 // ---------------------------------------------------------------------------
 
 fn parse_env(account: &Account) -> CanonicalEnvData {
-    serde_json::from_value(account.canonical_env.clone()).unwrap_or_default()
+    crate::model::identity::parse_canonical_env(&account.canonical_env)
 }
 
 fn parse_process(account: &Account) -> CanonicalProcessData {
@@ -572,7 +638,7 @@ fn compute_build_age_minutes(build_time: &str) -> Option<i64> {
 struct EventBatchCtx<'a> {
     account: &'a Account,
     uptime_secs: f64,
-    model: &'a str,
+    profile: TelemetryRequestProfile,
     cpu_user_total: i64,
     cpu_system_total: i64,
     cpu_percent: f64,
@@ -589,12 +655,9 @@ struct EventBatchCtx<'a> {
 
 /// 构造 /api/event_logging/batch 请求体。
 ///
-/// 真实 CC 的 `/batch` 端点每次 POST 承载多条事件，且事件类型是混合的
-/// （tengu_api_query + tengu_api_success 成对出现；首启时带 tengu_startup；偶发 tool_use_*）。
-/// 这里按最少可信集合构造：
-///   - 首个 batch 额外带 `tengu_startup`
-///   - 每个 batch 都带 `tengu_api_query` + `tengu_api_success` 成对
-///   - 偶发带 `tengu_tool_use_success`
+/// 真实 CC 的 `/batch` 端点每次 POST 承载多条事件。
+/// 这里仅构造与实际消息请求对应的最少可信集合：首个 batch 带 `tengu_startup`，
+/// 每个 batch 带 `tengu_api_query` + `tengu_api_success`；没有真实工具观察时不伪造工具事件。
 fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
     let env = parse_env(ctx.account);
     let proc = parse_process(ctx.account);
@@ -626,7 +689,7 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
     }
 
     // betas: 使用 rewriter 对同一模型计算出的真实 beta 列表
-    let betas = crate::service::rewriter::compute_betas_for_model(ctx.model).join(",");
+    let betas = ctx.profile.betas.clone();
     let build_age_mins = compute_build_age_minutes(&env.build_time);
 
     // tengu_api_success 的典型载荷 — 合理随机
@@ -644,7 +707,6 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
         "req_{}",
         uuid::Uuid::new_v4().simple().to_string()[..24].to_string()
     );
-    let emit_tool_use = rng.gen_bool(0.4); // 40% 概率夹带 tool_use_success
     drop(rng);
 
     // 统一的事件框架字段：任何 event_data 都带
@@ -657,21 +719,9 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
             "email": ctx.account.email,
             "session_id": ctx.session_id,
             "user_type": "external",
-            "is_interactive": true,
-            "client_type": "cli",
-            "entrypoint": "cli",
-            "agent_sdk_version": "",
-            "swe_bench_run_id": "",
-            "swe_bench_instance_id": "",
-            "swe_bench_task_id": "",
-            "agent_id": "",
-            "parent_session_id": "",
-            "agent_type": "",
-            "team_name": "",
-            "skill_name": "",
-            "plugin_name": "",
-            "marketplace_name": "",
-            "additional_metadata": "",
+            "is_interactive": ctx.profile.is_interactive,
+            "client_type": ctx.profile.client_type,
+            "entrypoint": ctx.profile.entrypoint,
             "auth": auth.clone(),
             "env": env_obj.clone(),
             "process": process_b64,
@@ -695,7 +745,7 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
     if ctx.emit_startup {
         let mut ev = make_base("tengu_startup", &process_b64);
         if let Some(m) = ev.as_object_mut() {
-            m.insert("model".into(), json!(ctx.model));
+            m.insert("model".into(), json!(ctx.profile.model));
             m.insert("provider".into(), json!("firstParty"));
             m.insert("isFirstSession".into(), json!(true));
             m.insert("querySource".into(), json!("user"));
@@ -707,15 +757,20 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
     {
         let mut ev = make_base("tengu_api_query", &process_b64);
         if let Some(m) = ev.as_object_mut() {
-            m.insert("model".into(), json!(ctx.model));
+            m.insert("model".into(), json!(ctx.profile.model));
             m.insert("messagesLength".into(), json!(message_count));
             m.insert("temperature".into(), json!(1.0));
             m.insert("provider".into(), json!("firstParty"));
             m.insert("betas".into(), json!(betas));
             m.insert("permissionMode".into(), json!("default"));
             m.insert("querySource".into(), json!("user"));
-            m.insert("thinkingType".into(), json!("disabled"));
-            m.insert("fastMode".into(), json!(false));
+            if let Some(ref thinking_type) = ctx.profile.thinking_type {
+                m.insert("thinkingType".into(), json!(thinking_type));
+            }
+            if let Some(ref effort) = ctx.profile.effort {
+                m.insert("effortValue".into(), json!(effort));
+            }
+            m.insert("fastMode".into(), json!(ctx.profile.fast_mode));
         }
         events.push(wrap(ev));
     }
@@ -724,7 +779,7 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
     {
         let mut ev = make_base("tengu_api_success", &process_b64);
         if let Some(m) = ev.as_object_mut() {
-            m.insert("model".into(), json!(ctx.model));
+            m.insert("model".into(), json!(ctx.profile.model));
             m.insert("betas".into(), json!(betas));
             m.insert("messageCount".into(), json!(message_count));
             m.insert("messageTokens".into(), json!(message_tokens));
@@ -740,24 +795,17 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
             m.insert("stop_reason".into(), json!("end_turn"));
             m.insert("costUSD".into(), json!(cost_usd));
             m.insert("didFallBackToNonStreaming".into(), json!(false));
-            m.insert("isNonInteractiveSession".into(), json!(false));
-            m.insert("print".into(), json!(false));
-            m.insert("isTTY".into(), json!(true));
+            m.insert(
+                "isNonInteractiveSession".into(),
+                json!(!ctx.profile.is_interactive),
+            );
+            m.insert("print".into(), json!(ctx.profile.entrypoint == "sdk-cli"));
+            m.insert("isTTY".into(), json!(ctx.profile.is_interactive));
             m.insert("querySource".into(), json!("user"));
             m.insert("provider".into(), json!("firstParty"));
-        }
-        events.push(wrap(ev));
-    }
-
-    // --- 偶发 tengu_tool_use_success ---
-    if emit_tool_use {
-        let mut ev = make_base("tengu_tool_use_success", &process_b64);
-        if let Some(m) = ev.as_object_mut() {
-            let tool_names = ["Read", "Bash", "Edit", "Grep", "Glob"];
-            let tool_idx = (ctx.cpu_user_total as usize) % tool_names.len();
-            m.insert("toolName".into(), json!(tool_names[tool_idx]));
-            m.insert("durationMs".into(), json!(rand::thread_rng().gen_range(5i64..800)));
-            m.insert("isMcp".into(), json!(false));
+            if let Some(ref effort) = ctx.profile.effort {
+                m.insert("effort_level".into(), json!(effort));
+            }
         }
         events.push(wrap(ev));
     }
@@ -797,6 +845,8 @@ fn build_growthbook_eval(account: &Account) -> serde_json::Value {
 /// 构造 /api/claude_code/metrics 请求体。
 fn build_metrics(account: &Account) -> serde_json::Value {
     let env = parse_env(account);
+    let prompt_env: crate::model::account::CanonicalPromptEnvData =
+        serde_json::from_value(account.canonical_prompt.clone()).unwrap_or_default();
     let os_type = match env.platform.as_str() {
         "darwin" => "Darwin",
         "win32" => "Windows",
@@ -807,6 +857,7 @@ fn build_metrics(account: &Account) -> serde_json::Value {
         "service.name": "claude-code",
         "service.version": env.version,
         "os.type": os_type,
+        "os.version": prompt_env.os_version,
         "host.arch": env.arch,
         "aggregation.temporality": "delta",
         "user.customer_type": "claude_ai",
@@ -839,14 +890,15 @@ mod tests {
             platform: "darwin".into(),
             platform_raw: "darwin".into(),
             arch: "arm64".into(),
-            node_version: "v22.15.0".into(),
+            node_version: crate::model::identity::CLAUDE_CODE_RUNTIME_VERSION.into(),
             terminal: "iTerm.app".into(),
+            shell: "zsh".into(),
             package_managers: "npm,pnpm".into(),
             runtimes: "node".into(),
             is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
+            version: crate::model::identity::CLAUDE_CODE_VERSION.into(),
+            version_base: crate::model::identity::CLAUDE_CODE_VERSION.into(),
+            build_time: crate::model::identity::CLAUDE_CODE_BUILD_TIME.into(),
             deployment_environment: "unknown-darwin".into(),
             vcs: "git".into(),
             ..Default::default()
@@ -880,7 +932,7 @@ mod tests {
             proxy_url: String::new(),
             device_id: "d".repeat(64),
             canonical_env: serde_json::to_value(make_env()).unwrap(),
-            canonical_prompt: json!({}),
+            canonical_prompt: json!({"os_version": "Darwin 25.6.0"}),
             canonical_process: serde_json::to_value(make_proc()).unwrap(),
             billing_mode: BillingMode::Strip,
             account_uuid: Some("11111111-2222-3333-4444-555555555555".into()),
@@ -909,10 +961,20 @@ mod tests {
         cpu_system: i64,
         emit_startup: bool,
     ) -> EventBatchCtx<'a> {
+        let body = serde_json::json!({});
         EventBatchCtx {
             account,
             uptime_secs: 42.0,
-            model,
+            profile: TelemetryRequestProfile {
+                model: model.into(),
+                betas: crate::service::rewriter::compute_betas_for_request(model, &body).join(","),
+                entrypoint: "cli".into(),
+                client_type: "cli".into(),
+                is_interactive: true,
+                thinking_type: None,
+                effort: None,
+                fast_mode: false,
+            },
             cpu_user_total: cpu_user,
             cpu_system_total: cpu_system,
             cpu_percent: 0.3,
@@ -934,9 +996,7 @@ mod tests {
             .as_array()
             .expect("events array")
             .iter()
-            .find(|e| {
-                e["event_data"]["event_name"].as_str() == Some("tengu_api_success")
-            })
+            .find(|e| e["event_data"]["event_name"].as_str() == Some("tengu_api_success"))
             .expect("tengu_api_success event missing")["event_data"]
             .as_object()
             .unwrap()
@@ -952,6 +1012,41 @@ mod tests {
             .iter()
             .find(|e| e["event_data"]["event_name"].as_str() == Some(name))
             .and_then(|e| e["event_data"].as_object())
+    }
+
+    #[test]
+    fn request_profile_preserves_sdk_entrypoint_thinking_and_effort() {
+        let headers = HashMap::from([
+            (
+                "User-Agent".into(),
+                "claude-cli/2.1.258 (external, sdk-cli)".into(),
+            ),
+            (
+                "anthropic-beta".into(),
+                "thinking-token-count-2026-05-13,effort-2025-11-24".into(),
+            ),
+        ]);
+        let body = json!({
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "low"}
+        });
+        let profile = TelemetryRequestProfile::from_request(
+            "claude-sonnet-5",
+            &headers,
+            &body,
+            ClientType::ClaudeCode,
+        );
+        assert_eq!(profile.entrypoint, "sdk-cli");
+        assert!(!profile.is_interactive);
+        assert_eq!(profile.thinking_type.as_deref(), Some("adaptive"));
+        assert_eq!(profile.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn event_batch_does_not_fabricate_tool_use_event() {
+        let account = make_account();
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-5", "sid", 0, 0, false));
+        assert!(find_event(&batch, "tengu_tool_use_success").is_none());
     }
 
     // ---- Task #2: Telemetry uses the tracked model + matching betas ----
@@ -973,8 +1068,8 @@ mod tests {
         let account = make_account();
         let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
         let betas = event_data(&batch)["betas"].as_str().unwrap().to_string();
-        let expected = crate::service::rewriter::compute_betas_for_model("claude-sonnet-4-5")
-            .join(",");
+        let expected =
+            crate::service::rewriter::compute_betas_for_model("claude-sonnet-4-5").join(",");
         assert_eq!(betas, expected);
         assert!(
             betas.contains("claude-code-20250219"),
@@ -1017,14 +1112,13 @@ mod tests {
     }
 
     #[test]
-    fn event_batch_haiku_4_5_keeps_isp_and_context_but_strips_claude_code() {
+    fn event_batch_haiku_4_5_keeps_isp_context_and_claude_code() {
         let account = make_account();
-        let batch =
-            build_event_batch(ctx_for(&account, "claude-haiku-4-5", "sid", 0, 0, false));
+        let batch = build_event_batch(ctx_for(&account, "claude-haiku-4-5", "sid", 0, 0, false));
         let betas = event_data(&batch)["betas"].as_str().unwrap();
         assert!(
-            !betas.contains("claude-code-20250219"),
-            "haiku-4-5 must not advertise claude-code beta, got: {}",
+            betas.contains("claude-code-20250219"),
+            "2.1.258 haiku-4-5 advertises claude-code beta, got: {}",
             betas
         );
         assert!(
@@ -1044,8 +1138,30 @@ mod tests {
     #[test]
     fn process_json_cpu_usage_is_cumulative() {
         let proc = make_proc();
-        let p1 = build_process_json(&proc, 1.0, 400_000_000, 150_000_000, 60_000_000, 2_000_000, 30_000, 1_000_000, 500_000, 0.5);
-        let p2 = build_process_json(&proc, 2.0, 400_000_000, 150_000_000, 60_000_000, 2_000_000, 30_000, 2_500_000, 900_000, 0.7);
+        let p1 = build_process_json(
+            &proc,
+            1.0,
+            400_000_000,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            1_000_000,
+            500_000,
+            0.5,
+        );
+        let p2 = build_process_json(
+            &proc,
+            2.0,
+            400_000_000,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            2_500_000,
+            900_000,
+            0.7,
+        );
 
         let u1 = p1["cpuUsage"]["user"].as_i64().unwrap();
         let u2 = p2["cpuUsage"]["user"].as_i64().unwrap();
@@ -1066,7 +1182,18 @@ mod tests {
     #[test]
     fn process_json_uptime_is_passed_through() {
         let proc = make_proc();
-        let p = build_process_json(&proc, 42.5, 400_000_000, 150_000_000, 60_000_000, 2_000_000, 30_000, 0, 0, 0.0);
+        let p = build_process_json(
+            &proc,
+            42.5,
+            400_000_000,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            0,
+            0,
+            0.0,
+        );
         assert_eq!(p["uptime"].as_f64().unwrap(), 42.5);
         assert_eq!(p["constrainedMemory"].as_i64().unwrap(), 0);
     }
@@ -1076,10 +1203,35 @@ mod tests {
         // 关键测试：rss/heapTotal/heapUsed 必须原样透传，而不是 random_in_range。
         // 修复前：同一个函数调用两次会得到不同随机值；修复后：完全确定性。
         let proc = make_proc();
-        let p1 = build_process_json(&proc, 1.0, 400_123_456, 150_000_000, 60_000_000, 2_000_000, 30_000, 0, 0, 0.0);
-        let p2 = build_process_json(&proc, 1.0, 400_123_456, 150_000_000, 60_000_000, 2_000_000, 30_000, 0, 0, 0.0);
+        let p1 = build_process_json(
+            &proc,
+            1.0,
+            400_123_456,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            0,
+            0,
+            0.0,
+        );
+        let p2 = build_process_json(
+            &proc,
+            1.0,
+            400_123_456,
+            150_000_000,
+            60_000_000,
+            2_000_000,
+            30_000,
+            0,
+            0,
+            0.0,
+        );
         assert_eq!(p1["rss"].as_i64(), Some(400_123_456));
-        assert_eq!(p1["rss"], p2["rss"], "same input → same output (not random)");
+        assert_eq!(
+            p1["rss"], p2["rss"],
+            "same input → same output (not random)"
+        );
         assert_eq!(p1["heapUsed"].as_i64(), Some(60_000_000));
     }
 
@@ -1088,7 +1240,14 @@ mod tests {
     #[test]
     fn event_batch_contains_all_tengu_api_success_fields() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 1_000, 500, false));
+        let batch = build_event_batch(ctx_for(
+            &account,
+            "claude-sonnet-4-5",
+            "sid",
+            1_000,
+            500,
+            false,
+        ));
         let data = event_data(&batch);
 
         let required = [
@@ -1163,7 +1322,14 @@ mod tests {
     #[test]
     fn event_batch_session_id_is_passed_through() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "fixed-sid-123", 0, 0, false));
+        let batch = build_event_batch(ctx_for(
+            &account,
+            "claude-sonnet-4-5",
+            "fixed-sid-123",
+            0,
+            0,
+            false,
+        ));
         let data = event_data(&batch);
         assert_eq!(
             data["session_id"].as_str(),
@@ -1175,9 +1341,19 @@ mod tests {
     #[test]
     fn event_batch_session_id_is_same_across_all_events_in_batch() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid-same", 0, 0, true));
+        let batch = build_event_batch(ctx_for(
+            &account,
+            "claude-sonnet-4-5",
+            "sid-same",
+            0,
+            0,
+            true,
+        ));
         let events = batch["events"].as_array().unwrap();
-        assert!(events.len() >= 2, "batch should have multiple events when emit_startup=true");
+        assert!(
+            events.len() >= 2,
+            "batch should have multiple events when emit_startup=true"
+        );
         for ev in events {
             assert_eq!(
                 ev["event_data"]["session_id"].as_str(),
@@ -1206,13 +1382,15 @@ mod tests {
     #[test]
     fn event_batch_emit_startup_adds_tengu_startup_once() {
         let account = make_account();
-        let batch_first = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, true));
+        let batch_first =
+            build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, true));
         assert!(
             find_event(&batch_first, "tengu_startup").is_some(),
             "first batch (emit_startup=true) must include tengu_startup"
         );
 
-        let batch_second = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
+        let batch_second =
+            build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
         assert!(
             find_event(&batch_second, "tengu_startup").is_none(),
             "subsequent batches (emit_startup=false) must NOT include tengu_startup"
@@ -1288,5 +1466,10 @@ mod tests {
         assert_eq!(attrs["user.customer_type"], "claude_ai");
         // 订阅类型透传
         assert_eq!(attrs["user.subscription_type"], "max");
+        assert_eq!(
+            attrs["service.version"],
+            crate::model::identity::CLAUDE_CODE_VERSION
+        );
+        assert_eq!(attrs["os.version"], "Darwin 25.6.0");
     }
 }

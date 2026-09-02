@@ -254,8 +254,7 @@ impl AccountService {
         // 1) 60s 内有成功查询 → 直接复用 DB 数据，不打上游。
         if let Some(fetched_at) = account.usage_fetched_at {
             let age = Utc::now().signed_duration_since(fetched_at);
-            if age.num_seconds() >= 0
-                && age.to_std().map(|d| d < USAGE_FRESH_TTL).unwrap_or(false)
+            if age.num_seconds() >= 0 && age.to_std().map(|d| d < USAGE_FRESH_TTL).unwrap_or(false)
             {
                 info!(
                     "refresh_usage: account {} → cache hit (age={}s, ttl=60s)",
@@ -314,10 +313,7 @@ impl AccountService {
     /// Same as `resolve_upstream_token` but reuses an already-fetched `Account`,
     /// avoiding a redundant `get_by_id` round-trip. The refresh path still
     /// re-reads fresh data internally, so stale local fields are safe.
-    pub async fn resolve_upstream_token_with(
-        &self,
-        account: &Account,
-    ) -> Result<String, AppError> {
+    pub async fn resolve_upstream_token_with(&self, account: &Account) -> Result<String, AppError> {
         match account.auth_type {
             AccountAuthType::SetupToken => {
                 if account.setup_token.is_empty() {
@@ -577,7 +573,7 @@ mod tests {
 
     #[test]
     fn session_hash_is_deterministic_for_same_input() {
-        let ua = "claude-cli/2.1.81 (external, cli)";
+        let ua = "claude-cli/9.9.9 (external, cli)";
         let body = json!({
             "system": "You are Claude Code",
             "messages": [{"role": "user", "content": "hello"}],
@@ -593,7 +589,7 @@ mod tests {
 
     #[test]
     fn session_hash_differs_by_system_prompt() {
-        let ua = "claude-cli/2.1.81";
+        let ua = "claude-cli/9.9.9";
         let a = json!({"system": "prompt-A", "messages": [{"role": "user", "content": "x"}]});
         let b = json!({"system": "prompt-B", "messages": [{"role": "user", "content": "x"}]});
         assert_ne!(
@@ -604,7 +600,7 @@ mod tests {
 
     #[test]
     fn session_hash_falls_back_to_first_message_when_no_system() {
-        let ua = "claude-cli/2.1.81";
+        let ua = "claude-cli/9.9.9";
         let a = json!({"messages": [{"role": "user", "content": "alpha"}]});
         let b = json!({"messages": [{"role": "user", "content": "beta"}]});
         let ha = generate_session_hash(ua, &a, ClientType::API);
@@ -616,7 +612,7 @@ mod tests {
     fn session_hash_no_longer_embeds_hour_window() {
         // 回归测试：哈希不应在任何形式上依赖当前时间。
         // 以前的实现把 Utc::now().format("%Y-%m-%dT%H") 拼到原文里，使 sticky TTL 被截断到 1 小时。
-        let ua = "claude-cli/2.1.81";
+        let ua = "claude-cli/9.9.9";
         let body = json!({
             "system": "stable-prompt",
             "messages": [{"role": "user", "content": "hi"}],
@@ -647,7 +643,7 @@ mod tests {
 
     #[test]
     fn session_hash_cc_mode_uses_session_id_from_metadata() {
-        let ua = "claude-cli/2.1.81";
+        let ua = "claude-cli/9.9.9";
         let body = json!({
             "metadata": {
                 "user_id": "{\"session_id\":\"sess-abc-123\",\"account_id\":\"xyz\"}"

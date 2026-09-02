@@ -91,9 +91,19 @@ async fn main() {
         limit_store.clone(),
     ));
     let rewriter = Arc::new(service::rewriter::Rewriter::new());
+    let fingerprint_audit = service::fingerprint_audit::FingerprintAudit::start(
+        cfg.fingerprint_audit_enabled,
+        &cfg.log_dir,
+    );
+    if fingerprint_audit.is_enabled() {
+        info!(
+            "fingerprint audit enabled: {}/fingerprint-audit.jsonl",
+            cfg.log_dir
+        );
+    }
     let telemetry_svc = Arc::new(service::telemetry::TelemetryService::new(
         account_store.clone(),
-        account_svc.clone(),
+        fingerprint_audit.clone(),
     ));
     let gateway_svc = Arc::new(service::gateway::GatewayService::new(
         account_svc.clone(),
@@ -101,6 +111,7 @@ async fn main() {
         telemetry_svc.clone(),
         limit_store.clone(),
         usage_svc.clone(),
+        fingerprint_audit,
     ));
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());

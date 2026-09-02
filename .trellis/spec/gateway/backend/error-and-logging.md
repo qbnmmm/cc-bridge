@@ -89,3 +89,50 @@ OAuth refresh 有明确降级：如果 refresh 失败但现有 access token 尚�
 Wrong：只创建 rolling appender 后立即丢弃 non-blocking guard，导致后台 writer 提前停止。
 
 Correct：在 `main` 保存 guard，并在文件初始化失败时明确降级为 stdout-only。
+
+## Scenario: 脱敏环境指纹审计
+
+### 1. Scope / Trigger
+
+- 需要线上复核 release/header/beta/telemetry 一致性，但不能保存原始请求、响应或凭证时启用。
+
+### 2. Signatures
+
+- 环境变量：`FINGERPRINT_AUDIT_ENABLED`，默认 `false`。
+- active file：`<LOG_DIR>/fingerprint-audit.jsonl`。
+- schema：versioned NDJSON；事件类型为 `profile_snapshot`、`telemetry_session`、`hourly_summary`、`fingerprint_anomaly`。
+
+### 3. Contracts
+
+- 只接收 typed sanitized observations，不允许把 raw header/body 或任意 `serde_json::Value` 交给 writer。
+- 允许字段：数字 account ID、release/profile、归一化 model/entrypoint/client type/beta、feature enum、presence boolean、状态码和计数。
+- 禁止字段：Authorization/Cookie/token/email、prompt/response/tool 内容、UUID 原值、relay/proxy URL、DSN 和代理凭证。
+- request path 使用 bounded `try_send`；文件 worker 独立写入，主请求不等待磁盘。
+- active file 10 MiB，active + 6 个历史文件；Unix 权限 `0600`。
+
+### 4. Validation & Error Matrix
+
+- 功能关闭 -> 不创建专用文件。
+- queue full -> 丢弃 observation、递增 dropped counter，主请求继续。
+- 目录/文件创建失败 -> `warn!`，audit 退化为空输出，网关继续。
+- 任意外部字符串不符合短 token allowlist -> 写 `other`，不得原样落盘。
+- serialization/flush 失败 -> `warn!`，不得转成 `AppError`。
+
+### 5. Good/Base/Bad Cases
+
+- Good：每小时每账号一条汇总，发现版本/UA/beta/request-ID 矛盾时立即写 anomaly。
+- Base：默认关闭；部署显式开启后从 `LOG_DIR` 获取文件。
+- Bad：逐请求保存完整 headers/body，或在 writer 队列满时阻塞流式响应。
+
+### 6. Tests Required
+
+- 禁写 key/pattern 扫描。
+- 任意 model/entrypoint/feature 输入归一化为 `other`。
+- queue 满时 `try_send` 不阻塞并增加 dropped counter。
+- writer 输出单行合法 JSON、权限 `0600`；关闭时不创建文件。
+
+### 7. Wrong vs Correct
+
+Wrong：复用普通 debug request logger 生成“诊断文件”，导致 token、prompt 或 UUID 泄漏。
+
+Correct：网关先提取 allowlisted enum/counter/presence，再提交给独立 audit worker。

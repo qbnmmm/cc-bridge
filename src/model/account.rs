@@ -213,12 +213,15 @@ impl Account {
 
 /// 存储 20+ 维度的环境指纹数据。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CanonicalEnvData {
     pub platform: String,
     pub platform_raw: String,
     pub arch: String,
     pub node_version: String,
     pub terminal: String,
+    #[serde(default)]
+    pub shell: String,
     pub package_managers: String,
     pub runtimes: String,
     #[serde(default)]
@@ -248,6 +251,7 @@ pub struct CanonicalEnvData {
 
 /// 系统提示词中的环境改写数据。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CanonicalPromptEnvData {
     pub platform: String,
     pub shell: String,

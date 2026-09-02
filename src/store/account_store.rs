@@ -156,6 +156,8 @@ impl AccountStore {
     }
 
     fn row_to_account(row: &AnyRow) -> Account {
+        let mut canonical_env = Self::parse_json(row, "canonical_env");
+        crate::model::identity::normalize_canonical_env_json(&mut canonical_env);
         Account {
             id: row.try_get::<i64, _>("id").unwrap_or_default(),
             name: row.try_get::<String, _>("name").unwrap_or_default(),
@@ -178,7 +180,7 @@ impl AccountStore {
             auth_error: row.try_get::<String, _>("auth_error").unwrap_or_default(),
             proxy_url: row.try_get::<String, _>("proxy_url").unwrap_or_default(),
             device_id: row.try_get::<String, _>("device_id").unwrap_or_default(),
-            canonical_env: Self::parse_json(row, "canonical_env"),
+            canonical_env,
             canonical_prompt: Self::parse_json(row, "canonical_prompt_env"),
             canonical_process: Self::parse_json(row, "canonical_process"),
             billing_mode: row
@@ -211,6 +213,7 @@ impl AccountStore {
     }
 
     pub async fn create(&self, a: &mut Account) -> Result<(), AppError> {
+        crate::model::identity::normalize_canonical_env_json(&mut a.canonical_env);
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) as cnt FROM accounts WHERE email=$1")
             .bind(&a.email)
             .fetch_one(&self.pool)
@@ -289,19 +292,24 @@ impl AccountStore {
         let oauth_refreshed_at = a.oauth_refreshed_at.map(|t| self.fmt_time(t));
         let auto_telemetry_int: i32 = if a.auto_telemetry { 1 } else { 0 };
         let prompt_str = serde_json::to_string(&a.canonical_prompt).unwrap_or_else(|_| "{}".into());
+        let mut canonical_env = a.canonical_env.clone();
+        crate::model::identity::normalize_canonical_env_json(&mut canonical_env);
+        let env_str = serde_json::to_string(&canonical_env).unwrap_or_else(|_| "{}".into());
         let q = format!(
             r#"UPDATE accounts SET name=$1, email=$2, status=$3, token=$4,
                 auth_type=$5, access_token=$6, refresh_token=$7, oauth_expires_at={}, oauth_refreshed_at={},
                 auth_error=$10, proxy_url=$11, billing_mode=$12,
                 account_uuid={}, organization_uuid={}, subscription_type={},
-                concurrency=$16, priority=$17, auto_telemetry=$18, canonical_prompt_env={}, updated_at={}
-            WHERE id=$20"#,
+                concurrency=$16, priority=$17, auto_telemetry=$18, canonical_prompt_env={},
+                canonical_env={}, updated_at={}
+            WHERE id=$21"#,
             self.nullable_ts(8),
             self.nullable_ts(9),
             self.nullable(13),
             self.nullable(14),
             self.nullable(15),
             self.jsonb(19),
+            self.jsonb(20),
             self.now_expr()
         );
         sqlx::query(&q)
@@ -324,6 +332,7 @@ impl AccountStore {
             .bind(a.priority)
             .bind(auto_telemetry_int)
             .bind(&prompt_str)
+            .bind(&env_str)
             .bind(a.id)
             .execute(&self.pool)
             .await?;
@@ -705,7 +714,7 @@ mod tests {
             "setup_token": "test-token",
             "proxy_url": "",
             "device_id": "test-device",
-            "canonical_env": {},
+            "canonical_env": {"future_field": {"enabled": true}},
             "canonical_prompt_env": {
                 "platform": "darwin",
                 "working_dir": "/Users/user/projects",
@@ -727,6 +736,23 @@ mod tests {
         let stored = store.get_by_id(account.id).await.unwrap();
         assert_eq!(stored.canonical_prompt["working_dir"], "/workspace/project");
         assert_eq!(stored.canonical_prompt["future_field"]["enabled"], true);
+        assert_eq!(
+            stored.canonical_env["version"],
+            crate::model::identity::CLAUDE_CODE_VERSION
+        );
+        assert_eq!(stored.canonical_env["future_field"]["enabled"], true);
+
+        let raw_env: String = sqlx::query_scalar("SELECT canonical_env FROM accounts WHERE id=$1")
+            .bind(account.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let raw_env: serde_json::Value = serde_json::from_str(&raw_env).unwrap();
+        assert_eq!(
+            raw_env["version"],
+            crate::model::identity::CLAUDE_CODE_VERSION
+        );
+        assert_eq!(raw_env["future_field"]["enabled"], true);
     }
 
     // ─── nullable() helper ───

@@ -59,39 +59,23 @@ pub enum ClientType {
     API,
 }
 
-const DEFAULT_VERSION: &str = "2.1.81";
-
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
 fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
     let mut seen = std::collections::HashSet::new();
     let mut tokens = Vec::new();
-    for t in required.split(',') {
-        let t = t.trim();
-        if !t.is_empty() && seen.insert(t.to_string()) {
-            tokens.push(t.to_string());
-        }
-    }
-    for t in incoming.split(',') {
-        let t = t.trim();
-        if !t.is_empty() && seen.insert(t.to_string()) {
-            tokens.push(t.to_string());
+    // Preserve the official client's order, then append bridge-required auth/first-party betas.
+    for source in [incoming, required] {
+        for token in source.split(',') {
+            let token = token.trim();
+            if !token.is_empty() && seen.insert(token.to_string()) {
+                tokens.push(token.to_string());
+            }
         }
     }
     tokens.join(",")
 }
 
-/// 根据模型返回正确的 anthropic-beta 值。
-///
-/// 依据 Claude Code `src/utils/betas.ts` 对 firstParty provider 的规则复刻
-/// （cc-bridge 固定转发到 api.anthropic.com，即 firstParty + claudeAISubscriber）：
-///
-/// - `CLAUDE_CODE_20250219`: 仅非 Haiku 模型
-/// - `OAUTH_BETA_HEADER`   : 始终（claudeAISubscriber）
-/// - `INTERLEAVED_THINKING`: firstParty 规则 `!claude-3-*`
-/// - `REDACT_THINKING`     : 需 ISP 支持（等价于 `!claude-3-*`，默认交互式会话）
-/// 剥离 model id 末尾的 `[1m]` 后缀（Claude Code CLI 用于标记 1M 上下文模式）。
-/// 返回 (去后缀的 model_id, 是否命中 1m)。Anthropic API 不认 `[1m]`，必须剥离并
-/// 另外发 `context-1m-2025-08-07` beta。
+/// 剥离 Claude Code 用于标记 1M 上下文的模型后缀。
 fn strip_1m_suffix(model_id: &str) -> (&str, bool) {
     if let Some(stripped) = model_id.strip_suffix("[1m]") {
         (stripped, true)
@@ -100,43 +84,85 @@ fn strip_1m_suffix(model_id: &str) -> (&str, bool) {
     }
 }
 
-/// - `CONTEXT_MANAGEMENT`  : Claude 4+ 模型（opus-4/sonnet-4/haiku-4）
-/// - `PROMPT_CACHING_SCOPE`: 始终（firstParty）
-pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
+fn request_has_active_thinking(body: &serde_json::Value) -> bool {
+    body.get("thinking")
+        .and_then(|value| value.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind != "disabled")
+}
+
+fn request_has_effort(body: &serde_json::Value) -> bool {
+    body.get("output_config")
+        .and_then(|value| value.get("effort"))
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        || body
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+}
+
+/// 构造 Claude Code 2.1.258 对 first-party + Claude subscriber 请求使用的 beta 顺序。
+/// 未知客户端 beta 由 `merge_anthropic_beta` 保留在列表末尾。
+pub fn compute_betas_for_request(model_id: &str, body: &serde_json::Value) -> Vec<&'static str> {
     let (base, needs_1m) = strip_1m_suffix(model_id);
-    let lower = base.to_lowercase();
+    let lower = base.to_ascii_lowercase();
     let is_haiku = lower.contains("haiku");
     let is_claude3 = lower.contains("claude-3-");
-    // firstParty: ISP 等价于 !claude-3-*（源码 betas.ts:107）
-    let supports_isp = !is_claude3;
-    // modelSupportsContextManagement: Claude 4+（源码 betas.ts:134-138）
     let is_claude4_plus = lower.contains("claude-opus-4")
         || lower.contains("claude-sonnet-4")
+        || lower.contains("claude-sonnet-5")
         || lower.contains("claude-haiku-4");
+    let has_thinking = request_has_active_thinking(body);
+    let has_effort = request_has_effort(body);
 
-    let mut out: Vec<&'static str> = Vec::new();
+    let mut out = Vec::new();
     if !is_haiku {
         out.push("claude-code-20250219");
     }
-    // claudeAISubscriber → OAUTH_BETA_HEADER
+    // cc-bridge upstream credentials are Claude subscriber/setup-token credentials.
     out.push("oauth-2025-04-20");
-    if supports_isp {
+    if !is_claude3 {
         out.push("interleaved-thinking-2025-05-14");
-        // REDACT_THINKING 取决于非交互/设置，代理默认发送交互态
-        out.push("redact-thinking-2026-02-12");
+    }
+    if needs_1m {
+        out.push("context-1m-2025-08-07");
+    }
+    if has_thinking {
+        out.push("thinking-token-count-2026-05-13");
     }
     if is_claude4_plus {
         out.push("context-management-2025-06-27");
     }
     out.push("prompt-caching-scope-2026-01-05");
-    if needs_1m {
-        out.push("context-1m-2025-08-07");
+    // 2.1.258 Haiku emits claude-code after prompt caching rather than omitting it.
+    if is_haiku && is_claude4_plus {
+        out.push("claude-code-20250219");
     }
+    if has_effort && !is_haiku {
+        out.push("mid-conversation-system-2026-04-07");
+        out.push("effort-2025-11-24");
+    }
+    out.push("cache-diagnosis-2026-04-07");
     out
 }
 
-fn beta_header_for_model(model_id: &str) -> String {
-    compute_betas_for_model(model_id).join(",")
+pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
+    compute_betas_for_request(model_id, &serde_json::json!({}))
+}
+
+fn beta_header_for_request(model_id: &str, body: &serde_json::Value) -> String {
+    compute_betas_for_request(model_id, body).join(",")
+}
+
+fn rewrite_claude_user_agent(incoming: &str, version: &str) -> String {
+    for prefix in ["claude-cli/", "claude-code/"] {
+        if let Some(rest) = incoming.strip_prefix(prefix) {
+            let suffix_at = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            return format!("{}{}{}", prefix, version, &rest[suffix_at..]);
+        }
+    }
+    format!("claude-cli/{} (external, cli)", version)
 }
 
 /// 处理所有请求的反检测改写。
@@ -159,11 +185,8 @@ impl Rewriter {
         body_map: &serde_json::Value,
     ) -> HashMap<String, String> {
         let env = self.parse_env(account);
-        let version = if env.version.is_empty() {
-            DEFAULT_VERSION
-        } else {
-            &env.version
-        };
+        let version = &env.version;
+        let required_betas = beta_header_for_request(model_id, body_map);
 
         let mut out = HashMap::new();
 
@@ -174,10 +197,7 @@ impl Rewriter {
                 "User-Agent".into(),
                 format!("claude-cli/{} (external, cli)", version),
             );
-            out.insert(
-                "anthropic-beta".into(),
-                beta_header_for_model(model_id).into(),
-            );
+            out.insert("anthropic-beta".into(), required_betas.clone());
             out.insert("anthropic-version".into(), "2023-06-01".into());
             out.insert(
                 "anthropic-dangerous-direct-browser-access".into(),
@@ -188,7 +208,10 @@ impl Rewriter {
             out.insert("accept-encoding".into(), "gzip, deflate, br, zstd".into());
             let stainless_os = stainless_os_from_platform(&env.platform);
             out.insert("X-Stainless-Lang".into(), "js".into());
-            out.insert("X-Stainless-Package-Version".into(), "0.70.0".into());
+            out.insert(
+                "X-Stainless-Package-Version".into(),
+                crate::model::identity::CLAUDE_CODE_STAINLESS_VERSION.into(),
+            );
             out.insert("X-Stainless-OS".into(), stainless_os.into());
             out.insert("X-Stainless-Arch".into(), env.arch.clone());
             out.insert("X-Stainless-Runtime".into(), "node".into());
@@ -240,10 +263,16 @@ impl Rewriter {
                 let wire_key = resolve_wire_casing(k);
                 match lower.as_str() {
                     "user-agent" => {
-                        out.insert(wire_key, format!("claude-cli/{} (external, cli)", version));
+                        out.insert(wire_key, rewrite_claude_user_agent(v, version));
                     }
                     "x-stainless-os" => {
                         out.insert(wire_key, stainless_os.to_string());
+                    }
+                    "x-stainless-package-version" => {
+                        out.insert(
+                            wire_key,
+                            crate::model::identity::CLAUDE_CODE_STAINLESS_VERSION.into(),
+                        );
                     }
                     "x-stainless-arch" => {
                         out.insert(wire_key, env.arch.clone());
@@ -257,15 +286,50 @@ impl Rewriter {
                 }
             }
 
-            // 确保必需 header 存在
+            // 确保 first-party 请求所需的稳定 header 存在，并规范化 release profile。
+            out.entry("Accept".into())
+                .or_insert_with(|| "application/json".into());
+            out.entry("content-type".into())
+                .or_insert_with(|| "application/json".into());
+            out.entry("accept-encoding".into())
+                .or_insert_with(|| "gzip, deflate, br, zstd".into());
+            out.entry("anthropic-version".into())
+                .or_insert_with(|| "2023-06-01".into());
             out.entry("anthropic-dangerous-direct-browser-access".into())
                 .or_insert_with(|| "true".into());
+            out.entry("x-app".into()).or_insert_with(|| "cli".into());
+            out.entry("X-Stainless-Lang".into())
+                .or_insert_with(|| "js".into());
+            out.insert(
+                "X-Stainless-Package-Version".into(),
+                crate::model::identity::CLAUDE_CODE_STAINLESS_VERSION.into(),
+            );
+            out.insert("X-Stainless-OS".into(), stainless_os.into());
+            out.insert("X-Stainless-Arch".into(), env.arch.clone());
+            out.entry("X-Stainless-Runtime".into())
+                .or_insert_with(|| "node".into());
+            out.insert(
+                "X-Stainless-Runtime-Version".into(),
+                env.node_version.clone(),
+            );
+            out.entry("X-Stainless-Retry-Count".into())
+                .or_insert_with(|| "0".into());
+            out.entry("X-Stainless-Timeout".into())
+                .or_insert_with(|| "600".into());
+            out.entry("User-Agent".into())
+                .or_insert_with(|| format!("claude-cli/{} (external, cli)", version));
+            let session_id =
+                extract_session_id_from_body(body_map).unwrap_or_else(generate_session_uuid);
+            out.entry("X-Claude-Code-Session-Id".into())
+                .or_insert(session_id);
+            out.entry("x-client-request-id".into())
+                .or_insert_with(generate_session_uuid);
 
             // 合并客户端 beta 与必需 beta
             let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
             out.insert(
                 "anthropic-beta".into(),
-                merge_anthropic_beta(&beta_header_for_model(model_id), &existing_beta),
+                merge_anthropic_beta(&required_betas, &existing_beta),
             );
         }
 
@@ -516,7 +580,7 @@ impl Rewriter {
         billing_mode: &BillingMode,
     ) {
         let version = if version.is_empty() {
-            DEFAULT_VERSION
+            crate::model::identity::CLAUDE_CODE_VERSION
         } else {
             version
         };
@@ -799,7 +863,7 @@ impl Rewriter {
     // --- 辅助解析 ---
 
     fn parse_env(&self, account: &Account) -> CanonicalEnvData {
-        serde_json::from_value(account.canonical_env.clone()).unwrap_or_default()
+        crate::model::identity::parse_canonical_env(&account.canonical_env)
     }
 
     fn parse_prompt_env(&self, account: &Account) -> CanonicalPromptEnvData {
@@ -1246,7 +1310,7 @@ fn scrub_git_user_in_reminders(body: &mut serde_json::Value, replacement_name: &
 /// 将 canonical env 的 platform 映射为 X-Stainless-OS 值。
 fn stainless_os_from_platform(platform: &str) -> &str {
     match platform {
-        "darwin" => "Mac OS X",
+        "darwin" => "MacOS",
         "win32" => "Windows",
         _ => "Linux",
     }
@@ -1254,87 +1318,97 @@ fn stainless_os_from_platform(platform: &str) -> &str {
 
 #[cfg(test)]
 mod beta_tests {
-    use super::{compute_betas_for_model, strip_1m_suffix};
+    use super::{
+        compute_betas_for_model, compute_betas_for_request, merge_anthropic_beta,
+        rewrite_claude_user_agent, strip_1m_suffix,
+    };
 
-    fn contains(set: &[&str], s: &str) -> bool {
-        set.iter().any(|x| *x == s)
+    fn contains(set: &[&str], value: &str) -> bool {
+        set.contains(&value)
     }
 
     #[test]
-    fn sonnet_4_5_gets_full_first_party_set() {
-        let b = compute_betas_for_model("claude-sonnet-4-5-20250929");
-        assert!(contains(&b, "claude-code-20250219"));
-        assert!(contains(&b, "oauth-2025-04-20"));
-        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
-        assert!(contains(&b, "redact-thinking-2026-02-12"));
-        assert!(contains(&b, "context-management-2025-06-27"));
-        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    fn sonnet_thinking_effort_matches_2_1_258_first_party_profile() {
+        let body = serde_json::json!({
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "low"}
+        });
+        let betas = compute_betas_for_request("claude-sonnet-5", &body);
+        assert_eq!(
+            betas,
+            vec![
+                "claude-code-20250219",
+                "oauth-2025-04-20",
+                "interleaved-thinking-2025-05-14",
+                "thinking-token-count-2026-05-13",
+                "context-management-2025-06-27",
+                "prompt-caching-scope-2026-01-05",
+                "mid-conversation-system-2026-04-07",
+                "effort-2025-11-24",
+                "cache-diagnosis-2026-04-07",
+            ]
+        );
+        assert!(!contains(&betas, "redact-thinking-2026-02-12"));
     }
 
     #[test]
-    fn opus_4_6_gets_full_first_party_set() {
-        let b = compute_betas_for_model("claude-opus-4-6");
-        assert!(contains(&b, "claude-code-20250219"));
-        assert!(contains(&b, "context-management-2025-06-27"));
-        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    fn haiku_thinking_keeps_claude_code_beta_in_captured_order() {
+        let body = serde_json::json!({"thinking": {"type": "enabled"}});
+        let betas = compute_betas_for_request("claude-haiku-4-5-20251001", &body);
+        assert_eq!(
+            betas,
+            vec![
+                "oauth-2025-04-20",
+                "interleaved-thinking-2025-05-14",
+                "thinking-token-count-2026-05-13",
+                "context-management-2025-06-27",
+                "prompt-caching-scope-2026-01-05",
+                "claude-code-20250219",
+                "cache-diagnosis-2026-04-07",
+            ]
+        );
     }
 
     #[test]
-    fn haiku_4_5_excludes_claude_code_but_keeps_isp_and_context_mgmt() {
-        let b = compute_betas_for_model("claude-haiku-4-5");
-        // Haiku 分支不发 claude-code-20250219
-        assert!(!contains(&b, "claude-code-20250219"));
-        // 但仍支持 ISP / context management / prompt-caching-scope
-        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
-        assert!(contains(&b, "redact-thinking-2026-02-12"));
-        assert!(contains(&b, "context-management-2025-06-27"));
-        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
-        assert!(contains(&b, "oauth-2025-04-20"));
+    fn claude_3_legacy_omits_interleaved_and_context_management() {
+        let betas = compute_betas_for_model("claude-3-opus-20240229");
+        assert!(contains(&betas, "claude-code-20250219"));
+        assert!(contains(&betas, "oauth-2025-04-20"));
+        assert!(!contains(&betas, "interleaved-thinking-2025-05-14"));
+        assert!(!contains(&betas, "context-management-2025-06-27"));
     }
 
     #[test]
-    fn haiku_3_5_strips_isp_and_context_mgmt() {
-        let b = compute_betas_for_model("claude-3-5-haiku-20241022");
-        assert!(!contains(&b, "claude-code-20250219"));
-        // claude-3-* 不支持 ISP（源码 betas.ts:107）
-        assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
-        assert!(!contains(&b, "redact-thinking-2026-02-12"));
-        // Claude 3 不支持 context-management
-        assert!(!contains(&b, "context-management-2025-06-27"));
-        // OAuth + prompt-caching-scope 仍存在
-        assert!(contains(&b, "oauth-2025-04-20"));
-        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    fn model_id_with_1m_suffix_adds_context_beta() {
+        let betas = compute_betas_for_model("claude-sonnet-4-6[1m]");
+        assert!(contains(&betas, "context-1m-2025-08-07"));
+        assert!(contains(&betas, "context-management-2025-06-27"));
     }
 
     #[test]
-    fn claude_3_opus_behaves_as_legacy() {
-        let b = compute_betas_for_model("claude-3-opus-20240229");
-        assert!(contains(&b, "claude-code-20250219")); // 非 haiku
-        assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
-        assert!(!contains(&b, "context-management-2025-06-27"));
-        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    fn user_agent_rewrite_preserves_entrypoint_and_sdk_metadata() {
+        assert_eq!(
+            rewrite_claude_user_agent(
+                "claude-cli/2.1.81 (external, sdk-cli, agent-sdk/1.0.0)",
+                "2.1.258",
+            ),
+            "claude-cli/2.1.258 (external, sdk-cli, agent-sdk/1.0.0)"
+        );
+        assert_eq!(
+            rewrite_claude_user_agent("claude-cli/9.9.9 (external, cli)", "2.1.258"),
+            "claude-cli/2.1.258 (external, cli)"
+        );
     }
 
     #[test]
-    fn ordering_is_stable_across_calls() {
-        let a = compute_betas_for_model("claude-sonnet-4-5");
-        let b = compute_betas_for_model("claude-sonnet-4-5");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn model_id_with_1m_suffix_adds_context_1m_beta() {
-        let b = compute_betas_for_model("claude-sonnet-4-6[1m]");
-        assert!(contains(&b, "context-1m-2025-08-07"));
-        // 基础 beta 按剥离后的 base model id（claude-sonnet-4-6）计算
-        assert!(contains(&b, "context-management-2025-06-27"));
-        assert!(contains(&b, "claude-code-20250219"));
-    }
-
-    #[test]
-    fn model_id_without_1m_suffix_omits_context_1m_beta() {
-        let b = compute_betas_for_model("claude-sonnet-4-5-20250929");
-        assert!(!contains(&b, "context-1m-2025-08-07"));
+    fn beta_merge_preserves_incoming_order_and_deduplicates() {
+        assert_eq!(
+            merge_anthropic_beta(
+                "oauth-2025-04-20,cache-diagnosis-2026-04-07",
+                "interleaved-thinking-2025-05-14,oauth-2025-04-20",
+            ),
+            "interleaved-thinking-2025-05-14,oauth-2025-04-20,cache-diagnosis-2026-04-07"
+        );
     }
 
     #[test]
@@ -1344,14 +1418,9 @@ mod beta_tests {
             ("claude-sonnet-4-6", true)
         );
         assert_eq!(
-            strip_1m_suffix("claude-opus-4-7[1m]"),
-            ("claude-opus-4-7", true)
-        );
-        assert_eq!(
             strip_1m_suffix("claude-sonnet-4-5-20250929"),
             ("claude-sonnet-4-5-20250929", false)
         );
-        assert_eq!(strip_1m_suffix("[1m]"), ("", true));
     }
 }
 
@@ -1382,7 +1451,7 @@ mod prompt_env_tests {
         Rewriter::new().rewrite_system_prompt(
             &mut body,
             &prompt_env("/Users/dev/new-project"),
-            "2.1.81",
+            crate::model::identity::CLAUDE_CODE_VERSION,
             &BillingMode::Strip,
         );
 
@@ -1409,7 +1478,7 @@ mod prompt_env_tests {
         Rewriter::new().rewrite_system_prompt(
             &mut body,
             &prompt_env("/workspace/project"),
-            "2.1.81",
+            crate::model::identity::CLAUDE_CODE_VERSION,
             &BillingMode::Strip,
         );
 
@@ -1431,7 +1500,7 @@ mod prompt_env_tests {
         Rewriter::new().rewrite_system_prompt(
             &mut body,
             &prompt_env("/Users/\u{5f00}\u{53d1}\u{8005}/\u{9879}\u{76ee}"),
-            "2.1.81",
+            crate::model::identity::CLAUDE_CODE_VERSION,
             &BillingMode::Strip,
         );
 
@@ -1450,13 +1519,106 @@ mod prompt_env_tests {
         Rewriter::new().rewrite_system_prompt(
             &mut body,
             &prompt_env("/workspace/project$archive"),
-            "2.1.81",
+            crate::model::identity::CLAUDE_CODE_VERSION,
             &BillingMode::Strip,
         );
 
         assert_eq!(
             body["system"],
             "Working directory: /workspace/project$archive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod header_profile_tests {
+    use super::{ClientType, Rewriter};
+    use crate::model::account::Account;
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn account() -> Account {
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "name": "profile",
+            "email": "profile@example.com",
+            "status": "active",
+            "auth_type": "oauth",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "proxy_url": "",
+            "device_id": "device",
+            "canonical_env": {
+                "platform": "darwin",
+                "platform_raw": "darwin",
+                "arch": "arm64",
+                "node_version": "v22.15.0",
+                "terminal": "iTerm.app",
+                "package_managers": "npm",
+                "runtimes": "node",
+                "version": "2.1.81",
+                "version_base": "2.1.81",
+                "build_time": "old"
+            },
+            "canonical_prompt_env": {},
+            "canonical_process": {},
+            "billing_mode": "strip",
+            "concurrency": 3,
+            "priority": 50,
+            "created_at": Utc::now(),
+            "updated_at": Utc::now()
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn claude_code_headers_preserve_suffix_and_normalize_release_profile() {
+        let headers = HashMap::from([
+            (
+                "User-Agent".into(),
+                "claude-cli/2.1.81 (external, sdk-cli, agent-sdk/1.2.3)".into(),
+            ),
+            (
+                "anthropic-beta".into(),
+                "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,claude-code-20250219".into(),
+            ),
+            ("X-Claude-Code-Session-Id".into(), "session".into()),
+        ]);
+        let body = serde_json::json!({
+            "model": "claude-haiku-4-5-20251001",
+            "thinking": {"type": "enabled"}
+        });
+        let output = Rewriter::new().rewrite_headers(
+            &headers,
+            &account(),
+            ClientType::ClaudeCode,
+            "claude-haiku-4-5-20251001",
+            &body,
+        );
+        assert_eq!(
+            output.get("User-Agent").map(String::as_str),
+            Some("claude-cli/2.1.258 (external, sdk-cli, agent-sdk/1.2.3)")
+        );
+        assert_eq!(
+            output
+                .get("X-Stainless-Package-Version")
+                .map(String::as_str),
+            Some("0.112.1")
+        );
+        assert_eq!(
+            output.get("X-Stainless-OS").map(String::as_str),
+            Some("MacOS")
+        );
+        assert_eq!(
+            output
+                .get("X-Stainless-Runtime-Version")
+                .map(String::as_str),
+            Some("v26.3.0")
+        );
+        assert!(output.contains_key("x-client-request-id"));
+        assert_eq!(
+            output.get("X-Claude-Code-Session-Id").map(String::as_str),
+            Some("session")
         );
     }
 }

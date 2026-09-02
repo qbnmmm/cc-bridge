@@ -482,6 +482,24 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 
 > Datadog 遥测由客户端直连 `browser-intake-datadoghq.com`，无法通过网关拦截。建议在网络层屏蔽。
 
+### 脱敏环境指纹审计
+
+如需对线上请求画像和自动遥测的一致性做周期复核，可显式启用：
+
+```env
+FINGERPRINT_AUDIT_ENABLED=true
+```
+
+启用后写入 `<LOG_DIR>/fingerprint-audit.jsonl`：
+
+- 仅记录 profile snapshot、遥测 session 状态、小时汇总和即时 anomaly；
+- 单文件 10 MiB，保留 6 个历史文件；Unix 文件权限为 `0600`；
+- 使用有界非阻塞队列，队列满或文件写入失败不会影响主请求；
+- 允许记录版本、平台、模型、entrypoint、beta、thinking/effort、状态码和计数；
+- 不记录 token、Cookie、邮箱、prompt/response、工具内容、UUID 原值、上游 URL、DSN 或代理凭证。
+
+默认关闭。需要离线分析时只分享该 NDJSON 文件，不要分享普通 debug 日志或数据库文件。
+
 ---
 
 ## 架构概览

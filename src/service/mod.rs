@@ -1,4 +1,5 @@
 pub mod account;
+pub mod fingerprint_audit;
 pub mod gateway;
 pub mod limit;
 pub mod oauth;

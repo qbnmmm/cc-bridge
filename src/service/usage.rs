@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, NaiveDate, Utc};
@@ -20,6 +20,7 @@ use crate::model::usage::{
     UsageGranularity, UsageGroupBy, UsageMetrics, UsagePricingUpdate, UsageReport,
     UsageReportQuery, UsageTokens,
 };
+use crate::service::fingerprint_audit::FingerprintAudit;
 use crate::service::usage_pricing::{
     PricingEngine, PricingSnapshot, fetch_remote_pricing_snapshot,
 };
@@ -75,6 +76,8 @@ impl UsageContentEncoding {
 pub struct UsageAttempt {
     pub attempt_id: String,
     pub occurred_at_utc: DateTime<Utc>,
+    started_at: Instant,
+    pub telemetry_enabled: bool,
     pub account_id: i64,
     pub api_token_id: i64,
     pub request_model: String,
@@ -94,6 +97,8 @@ impl UsageAttempt {
         Self {
             attempt_id: uuid::Uuid::new_v4().to_string(),
             occurred_at_utc: Utc::now(),
+            started_at: Instant::now(),
+            telemetry_enabled: false,
             account_id,
             api_token_id,
             request_model,
@@ -114,6 +119,23 @@ impl UsageAttempt {
         self.upstream_request_id = upstream_request_id;
         self.content_encoding = content_encoding;
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedInferenceObservation {
+    pub correlation_id: String,
+    pub account_id: i64,
+    pub completed_at_utc: DateTime<Utc>,
+    pub model: String,
+    pub upstream_request_id: Option<String>,
+    pub tokens: Option<UsageTokens>,
+    pub cost_nano_usd: Option<i64>,
+    pub duration_ms: i64,
+    pub ttft_ms: Option<i64>,
+    pub stop_reason: Option<String>,
+    pub http_status: u16,
+    pub is_stream: bool,
+    pub client_dropped: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,13 +166,31 @@ pub struct UsageService {
     store: Arc<UsageStore>,
     pricing: Arc<RwLock<PricingEngine>>,
     sender: mpsc::Sender<UsageEvent>,
+    completion_sender: Option<mpsc::Sender<CompletedInferenceObservation>>,
+    completion_audit: Option<Arc<FingerprintAudit>>,
     health: Arc<UsageHealthCounters>,
     since_utc: DateTime<Utc>,
 }
 
 impl UsageService {
     pub async fn start(store: Arc<UsageStore>, pricing: PricingEngine) -> Arc<Self> {
-        Self::start_inner(store, pricing, true).await
+        Self::start_inner(store, pricing, true, None, None).await
+    }
+
+    pub async fn start_with_completion(
+        store: Arc<UsageStore>,
+        pricing: PricingEngine,
+        completion_sender: mpsc::Sender<CompletedInferenceObservation>,
+        completion_audit: Arc<FingerprintAudit>,
+    ) -> Arc<Self> {
+        Self::start_inner(
+            store,
+            pricing,
+            true,
+            Some(completion_sender),
+            Some(completion_audit),
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -158,13 +198,15 @@ impl UsageService {
         store: Arc<UsageStore>,
         pricing: PricingEngine,
     ) -> Arc<Self> {
-        Self::start_inner(store, pricing, false).await
+        Self::start_inner(store, pricing, false, None, None).await
     }
 
     async fn start_inner(
         store: Arc<UsageStore>,
         mut pricing: PricingEngine,
         refresh_pricing: bool,
+        completion_sender: Option<mpsc::Sender<CompletedInferenceObservation>>,
+        completion_audit: Option<Arc<FingerprintAudit>>,
     ) -> Arc<Self> {
         match store.load_pricing_snapshot().await {
             Ok(Some(json)) => match PricingSnapshot::from_json(&json)
@@ -186,6 +228,8 @@ impl UsageService {
             store: store.clone(),
             pricing: pricing.clone(),
             sender,
+            completion_sender,
+            completion_audit,
             health: health.clone(),
             since_utc: Utc::now(),
         });
@@ -323,7 +367,13 @@ impl UsageService {
             .collect())
     }
 
-    fn submit(&self, attempt: UsageAttempt, parsed: ParsedUsage) {
+    fn submit(
+        &self,
+        attempt: UsageAttempt,
+        parsed: ParsedUsage,
+        client_dropped: bool,
+        first_byte_at: Option<Instant>,
+    ) {
         if !parsed.has_usage {
             return;
         }
@@ -343,6 +393,25 @@ impl UsageService {
         } else {
             format!("attempt:{}", attempt.attempt_id)
         };
+        let completion = CompletedInferenceObservation {
+            correlation_id: attempt.attempt_id.clone(),
+            account_id: attempt.account_id,
+            completed_at_utc: Utc::now(),
+            model: model.clone(),
+            upstream_request_id: attempt.upstream_request_id.clone(),
+            tokens: Some(parsed.tokens.clone()),
+            cost_nano_usd: priced.costs.complete.then_some(priced.costs.known_nano_usd),
+            duration_ms: i64::try_from(attempt.started_at.elapsed().as_millis())
+                .unwrap_or(i64::MAX),
+            ttft_ms: first_byte_at.map(|instant| {
+                i64::try_from(instant.duration_since(attempt.started_at).as_millis())
+                    .unwrap_or(i64::MAX)
+            }),
+            stop_reason: parsed.stop_reason.clone(),
+            http_status: attempt.http_status,
+            is_stream: attempt.is_stream,
+            client_dropped,
+        };
         let event = UsageEvent {
             dedup_key,
             upstream_message_id: parsed.message_id,
@@ -359,6 +428,7 @@ impl UsageService {
             http_status: attempt.http_status,
             is_stream: attempt.is_stream,
         };
+        self.send_completion(completion, attempt.telemetry_enabled);
         self.health.observed.fetch_add(1, Ordering::Relaxed);
         if let Err(error) = self.sender.try_send(event) {
             let kind = match error {
@@ -373,6 +443,49 @@ impl UsageService {
                 );
             }
         }
+    }
+
+    fn send_completion(&self, observation: CompletedInferenceObservation, enabled: bool) {
+        if !enabled {
+            return;
+        }
+        if let Some(sender) = &self.completion_sender {
+            let account_id = observation.account_id;
+            if sender.try_send(observation).is_err() {
+                warn!("telemetry completion observation dropped: queue unavailable");
+                if let Some(audit) = &self.completion_audit {
+                    audit.observe_telemetry(account_id, "observation_dropped", false);
+                }
+            }
+        }
+    }
+
+    fn complete_without_usage(
+        &self,
+        attempt: UsageAttempt,
+        client_dropped: bool,
+        first_byte_at: Option<Instant>,
+    ) {
+        let observation = CompletedInferenceObservation {
+            correlation_id: attempt.attempt_id,
+            account_id: attempt.account_id,
+            completed_at_utc: Utc::now(),
+            model: attempt.request_model,
+            upstream_request_id: attempt.upstream_request_id,
+            tokens: None,
+            cost_nano_usd: None,
+            duration_ms: i64::try_from(attempt.started_at.elapsed().as_millis())
+                .unwrap_or(i64::MAX),
+            ttft_ms: first_byte_at.map(|instant| {
+                i64::try_from(instant.duration_since(attempt.started_at).as_millis())
+                    .unwrap_or(i64::MAX)
+            }),
+            stop_reason: None,
+            http_status: attempt.http_status,
+            is_stream: attempt.is_stream,
+            client_dropped,
+        };
+        self.send_completion(observation, attempt.telemetry_enabled);
     }
 
     fn record_parse_failure(&self, oversize: bool) {
@@ -441,6 +554,7 @@ struct ResponseObserver {
     service: Arc<UsageService>,
     attempt: Option<UsageAttempt>,
     parser: EncodedResponseParser,
+    first_byte_at: Option<Instant>,
 }
 
 impl ResponseObserver {
@@ -455,6 +569,7 @@ impl ResponseObserver {
             service,
             attempt: Some(attempt),
             parser,
+            first_byte_at: None,
         }
     }
 
@@ -462,9 +577,12 @@ impl ResponseObserver {
         if self.attempt.is_none() {
             return;
         }
+        if !bytes.is_empty() && self.first_byte_at.is_none() {
+            self.first_byte_at = Some(Instant::now());
+        }
         self.parser.feed(bytes);
         if self.parser.is_complete() && self.parser.can_finalize_early() {
-            self.finalize(false);
+            self.finalize(false, false);
         }
     }
 
@@ -473,27 +591,38 @@ impl ResponseObserver {
             return;
         }
         self.parser.finish(client_dropped);
-        self.finalize(true);
+        self.finalize(true, client_dropped);
     }
 
-    fn finalize(&mut self, terminal: bool) {
+    fn finalize(&mut self, terminal: bool, client_dropped: bool) {
         if self.parser.is_invalid() {
-            let attempt = self.attempt.take();
-            if attempt.is_some() {
+            if let Some(attempt) = self.attempt.take() {
                 self.service.record_parse_failure(self.parser.is_oversize());
+                self.service
+                    .complete_without_usage(attempt, client_dropped, self.first_byte_at);
             }
             return;
         }
         if let Some(parsed) = self.parser.parsed() {
             if parsed.has_usage && (terminal || self.parser.is_complete()) {
                 if let Some(attempt) = self.attempt.take() {
-                    self.service.submit(attempt, parsed);
+                    self.service
+                        .submit(attempt, parsed, client_dropped, self.first_byte_at);
                 }
             } else if terminal {
-                self.attempt.take();
+                if let Some(attempt) = self.attempt.take() {
+                    self.service.complete_without_usage(
+                        attempt,
+                        client_dropped,
+                        self.first_byte_at,
+                    );
+                }
             }
         } else if terminal {
-            self.attempt.take();
+            if let Some(attempt) = self.attempt.take() {
+                self.service
+                    .complete_without_usage(attempt, client_dropped, self.first_byte_at);
+            }
         }
     }
 }
@@ -896,6 +1025,7 @@ struct SseParser {
     message_id: Option<String>,
     model: Option<String>,
     tokens: UsageTokens,
+    stop_reason: Option<String>,
     has_usage: bool,
     complete: bool,
     invalid: bool,
@@ -965,6 +1095,9 @@ impl SseParser {
                 }
             }
             Some("message_delta") => {
+                if let Some(reason) = value.get("delta").and_then(stop_reason_field) {
+                    self.stop_reason = Some(reason);
+                }
                 if let Some(usage) = value.get("usage") {
                     match parse_usage_patch(usage) {
                         Ok(patch) => {
@@ -985,6 +1118,7 @@ impl SseParser {
             message_id: self.message_id.clone(),
             model: self.model.clone(),
             tokens: self.tokens.clone(),
+            stop_reason: self.stop_reason.clone(),
             has_usage: true,
         })
     }
@@ -995,6 +1129,7 @@ struct ParsedUsage {
     message_id: Option<String>,
     model: Option<String>,
     tokens: UsageTokens,
+    stop_reason: Option<String>,
     has_usage: bool,
 }
 
@@ -1048,6 +1183,7 @@ fn parse_json_response(value: &Value) -> Result<ParsedUsage, ()> {
         message_id: string_field(value, "id"),
         model: string_field(value, "model"),
         tokens,
+        stop_reason: stop_reason_field(value),
         has_usage,
     })
 }
@@ -1081,6 +1217,21 @@ fn optional_token(value: Option<&Value>) -> Result<Option<i64>, ()> {
             .map(Some)
             .ok_or(()),
     }
+}
+
+fn stop_reason_field(value: &Value) -> Option<String> {
+    string_field(value, "stop_reason").filter(|reason| {
+        matches!(
+            reason.as_str(),
+            "end_turn"
+                | "max_tokens"
+                | "stop_sequence"
+                | "tool_use"
+                | "pause_turn"
+                | "refusal"
+                | "model_context_window_exceeded"
+        )
+    })
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
@@ -1979,5 +2130,53 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[tokio::test]
+    async fn completed_observation_uses_real_json_usage_and_stop_reason() {
+        sqlx::any::install_default_drivers();
+        let path =
+            std::env::temp_dir().join(format!("ccbridge_completion_{}.db", rand::random::<u64>()));
+        let pool = crate::store::db::init_db("sqlite", path.to_str().unwrap())
+            .await
+            .unwrap();
+        crate::store::db::migrate(&pool, "sqlite").await.unwrap();
+        let store = Arc::new(UsageStore::new(pool.clone(), "sqlite".into()));
+        let (sender, mut receiver) = mpsc::channel(4);
+        let service = UsageService::start_inner(
+            store,
+            PricingEngine::from_override_json(None).unwrap(),
+            false,
+            Some(sender),
+            Some(crate::service::fingerprint_audit::FingerprintAudit::start(
+                false, "",
+            )),
+        )
+        .await;
+        let response = Bytes::from_static(br#"{"id":"msg_real","model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":11,"output_tokens":9,"cache_creation_input_tokens":7,"cache_read_input_tokens":5}}"#);
+        let stream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(response)]);
+        let mut attempt = UsageAttempt::begin(1, 2, "fallback".into(), false);
+        attempt.telemetry_enabled = true;
+        attempt.complete_response(
+            200,
+            Some("req_real_123".into()),
+            UsageContentEncoding::Identity,
+        );
+        let _: Vec<_> = service.observe_stream(stream, attempt).collect().await;
+        let observation = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.model, "claude-opus-5");
+        assert_eq!(observation.tokens.unwrap().input, 11);
+        assert_eq!(observation.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            observation.upstream_request_id.as_deref(),
+            Some("req_real_123")
+        );
+        assert!(observation.duration_ms >= 0);
+        assert!(observation.ttft_ms.is_some());
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
     }
 }

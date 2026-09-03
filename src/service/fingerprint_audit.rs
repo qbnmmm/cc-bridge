@@ -13,7 +13,7 @@ use tracing::warn;
 
 use crate::model::account::{Account, CanonicalEnvData};
 
-const AUDIT_SCHEMA_VERSION: u32 = 1;
+const AUDIT_SCHEMA_VERSION: u32 = 2;
 const AUDIT_FILE_NAME: &str = "fingerprint-audit.jsonl";
 const AUDIT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 const AUDIT_MAX_HISTORY_FILES: usize = 6;
@@ -108,6 +108,12 @@ enum AuditMessage {
         account_id: i64,
         status: u16,
     },
+    CountTokens {
+        account_id: i64,
+    },
+    SendFailed {
+        account_id: i64,
+    },
     Telemetry {
         account_id: i64,
         event_name: &'static str,
@@ -126,11 +132,15 @@ struct AccountCounters {
     auto_telemetry: bool,
     profile: Option<AuditProfile>,
     requests: u64,
+    count_token_requests: u64,
     stream_requests: u64,
     status_2xx: u64,
+    status_3xx: u64,
     status_403: u64,
     status_429: u64,
+    status_4xx_other: u64,
     status_5xx: u64,
+    send_failed: u64,
     thinking_requests: u64,
     effort_requests: u64,
     session_id_present: u64,
@@ -185,11 +195,15 @@ struct HourlySummaryRecord<'a> {
     auto_telemetry: bool,
     profile: Option<&'a AuditProfile>,
     requests: u64,
+    count_token_requests: u64,
     stream_requests: u64,
     status_2xx: u64,
+    status_3xx: u64,
     status_403: u64,
     status_429: u64,
+    status_4xx_other: u64,
     status_5xx: u64,
+    send_failed: u64,
     thinking_requests: u64,
     effort_requests: u64,
     session_id_present: u64,
@@ -202,6 +216,7 @@ struct HourlySummaryRecord<'a> {
     telemetry_failed: u64,
     mismatches: &'a BTreeMap<FingerprintMismatch, u64>,
     dropped_audit_observations: u64,
+    in_flight_at_end: u64,
 }
 
 pub struct FingerprintAudit {
@@ -241,6 +256,14 @@ impl FingerprintAudit {
 
     pub fn observe_response(&self, account_id: i64, status: u16) {
         self.try_send(AuditMessage::Response { account_id, status });
+    }
+
+    pub fn observe_count_tokens(&self, account_id: i64) {
+        self.try_send(AuditMessage::CountTokens { account_id });
+    }
+
+    pub fn observe_send_failed(&self, account_id: i64) {
+        self.try_send(AuditMessage::SendFailed { account_id });
     }
 
     pub fn observe_telemetry(&self, account_id: i64, event_name: &'static str, success: bool) {
@@ -289,6 +312,8 @@ async fn audit_worker(
         }
     };
     let mut counters: HashMap<i64, AccountCounters> = HashMap::new();
+    let mut last_profiles: HashMap<i64, AuditProfile> = HashMap::new();
+    let mut in_flight: HashMap<i64, u64> = HashMap::new();
     let mut interval = tokio::time::interval(flush_interval);
     interval.tick().await;
 
@@ -296,13 +321,13 @@ async fn audit_worker(
         tokio::select! {
             maybe = receiver.recv() => {
                 let Some(message) = maybe else {
-                    flush_summaries(&mut appender, &mut counters, dropped.swap(0, Ordering::Relaxed));
+                    flush_summaries(&mut appender, &mut counters, &in_flight, dropped.swap(0, Ordering::Relaxed));
                     break;
                 };
-                apply_message(&mut appender, &mut counters, message);
+                apply_message(&mut appender, &mut counters, &mut last_profiles, &mut in_flight, message);
             }
             _ = interval.tick() => {
-                flush_summaries(&mut appender, &mut counters, dropped.swap(0, Ordering::Relaxed));
+                flush_summaries(&mut appender, &mut counters, &in_flight, dropped.swap(0, Ordering::Relaxed));
             }
         }
     }
@@ -311,15 +336,19 @@ async fn audit_worker(
 fn apply_message(
     appender: &mut Option<AuditAppender>,
     counters: &mut HashMap<i64, AccountCounters>,
+    last_profiles: &mut HashMap<i64, AuditProfile>,
+    in_flight: &mut HashMap<i64, u64>,
     message: AuditMessage,
 ) {
     match message {
         AuditMessage::Request(observation) => {
             let counter = counters.entry(observation.account_id).or_default();
-            let profile_changed = counter.profile.as_ref() != Some(&observation.profile);
+            let profile_changed =
+                last_profiles.get(&observation.account_id) != Some(&observation.profile);
             counter.auth_type = observation.auth_type;
             counter.auto_telemetry = observation.auto_telemetry;
             counter.requests += 1;
+            *in_flight.entry(observation.account_id).or_default() += 1;
             counter.stream_requests += u64::from(observation.stream);
             counter.thinking_requests += u64::from(observation.thinking.is_some());
             counter.effort_requests += u64::from(observation.effort.is_some());
@@ -338,8 +367,9 @@ fn apply_message(
                 *counter.betas.entry(beta).or_default() += 1;
             }
 
+            counter.profile = Some(observation.profile.clone());
             if profile_changed {
-                counter.profile = Some(observation.profile.clone());
+                last_profiles.insert(observation.account_id, observation.profile.clone());
                 let record = ProfileSnapshotRecord {
                     schema_version: AUDIT_SCHEMA_VERSION,
                     event: "profile_snapshot",
@@ -369,11 +399,23 @@ fn apply_message(
             let counter = counters.entry(account_id).or_default();
             match status {
                 200..=299 => counter.status_2xx += 1,
+                300..=399 => counter.status_3xx += 1,
                 403 => counter.status_403 += 1,
                 429 => counter.status_429 += 1,
+                400..=499 => counter.status_4xx_other += 1,
                 500..=599 => counter.status_5xx += 1,
                 _ => {}
             }
+            let current = in_flight.entry(account_id).or_default();
+            *current = current.saturating_sub(1);
+        }
+        AuditMessage::CountTokens { account_id } => {
+            counters.entry(account_id).or_default().count_token_requests += 1;
+        }
+        AuditMessage::SendFailed { account_id } => {
+            counters.entry(account_id).or_default().send_failed += 1;
+            let current = in_flight.entry(account_id).or_default();
+            *current = current.saturating_sub(1);
         }
         AuditMessage::Telemetry {
             account_id,
@@ -410,6 +452,7 @@ fn apply_message(
 fn flush_summaries(
     appender: &mut Option<AuditAppender>,
     counters: &mut HashMap<i64, AccountCounters>,
+    in_flight: &HashMap<i64, u64>,
     dropped: u64,
 ) {
     let timestamp = Utc::now();
@@ -423,11 +466,15 @@ fn flush_summaries(
             auto_telemetry: counter.auto_telemetry,
             profile: counter.profile.as_ref(),
             requests: counter.requests,
+            count_token_requests: counter.count_token_requests,
             stream_requests: counter.stream_requests,
             status_2xx: counter.status_2xx,
+            status_3xx: counter.status_3xx,
             status_403: counter.status_403,
             status_429: counter.status_429,
+            status_4xx_other: counter.status_4xx_other,
             status_5xx: counter.status_5xx,
+            send_failed: counter.send_failed,
             thinking_requests: counter.thinking_requests,
             effort_requests: counter.effort_requests,
             session_id_present: counter.session_id_present,
@@ -440,6 +487,7 @@ fn flush_summaries(
             telemetry_failed: counter.telemetry_failed,
             mismatches: &counter.mismatches,
             dropped_audit_observations: dropped,
+            in_flight_at_end: *in_flight.get(account_id).unwrap_or(&0),
         };
         write_record(appender, &record);
     }
@@ -670,6 +718,97 @@ mod tests {
                 0o600
             );
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn audit_v2_keeps_profile_across_windows_and_classifies_statuses() {
+        let dir = std::env::temp_dir().join(format!("audit-v2-{}", uuid::Uuid::new_v4()));
+        let mut appender = Some(create_audit_appender(&dir).unwrap());
+        let profile = AuditProfile {
+            claude_version: "2.1.258".into(),
+            build_time: "2026-09-01T21:54:40Z".into(),
+            stainless_package: "0.112.1".into(),
+            platform: "darwin".into(),
+            arch: "arm64".into(),
+            stainless_os: "MacOS".into(),
+            runtime: "node".into(),
+            runtime_version: "v26.3.0".into(),
+            is_running_with_bun: true,
+        };
+        let observation = AuditRequestObservation {
+            account_id: 1,
+            auth_type: "oauth".into(),
+            auto_telemetry: true,
+            profile: profile.clone(),
+            client_type: "claude_code".into(),
+            entrypoint: "cli".into(),
+            model: "claude-opus-5".into(),
+            stream: true,
+            thinking: Some("adaptive".into()),
+            effort: Some("high".into()),
+            betas: vec![],
+            session_id_present: true,
+            client_request_id_present: true,
+            mismatches: vec![],
+        };
+        let mut counters = HashMap::new();
+        let mut profiles = HashMap::new();
+        let mut in_flight = HashMap::new();
+        apply_message(
+            &mut appender,
+            &mut counters,
+            &mut profiles,
+            &mut in_flight,
+            AuditMessage::Request(observation.clone()),
+        );
+        apply_message(
+            &mut appender,
+            &mut counters,
+            &mut profiles,
+            &mut in_flight,
+            AuditMessage::Response {
+                account_id: 1,
+                status: 302,
+            },
+        );
+        apply_message(
+            &mut appender,
+            &mut counters,
+            &mut profiles,
+            &mut in_flight,
+            AuditMessage::Request(observation.clone()),
+        );
+        apply_message(
+            &mut appender,
+            &mut counters,
+            &mut profiles,
+            &mut in_flight,
+            AuditMessage::Response {
+                account_id: 1,
+                status: 400,
+            },
+        );
+        flush_summaries(&mut appender, &mut counters, &in_flight, 0);
+        apply_message(
+            &mut appender,
+            &mut counters,
+            &mut profiles,
+            &mut in_flight,
+            AuditMessage::Request(observation),
+        );
+        flush_summaries(&mut appender, &mut counters, &in_flight, 0);
+        drop(appender);
+        let text = std::fs::read_to_string(dir.join(AUDIT_FILE_NAME)).unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("profile_snapshot"))
+                .count(),
+            1
+        );
+        assert!(text.contains("\"status_3xx\":1"));
+        assert!(text.contains("\"status_4xx_other\":1"));
+        assert!(text.contains("\"in_flight_at_end\":1"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

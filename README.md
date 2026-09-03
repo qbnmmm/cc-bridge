@@ -500,6 +500,8 @@ FINGERPRINT_AUDIT_ENABLED=true
 
 默认关闭。需要离线分析时只分享该 NDJSON 文件，不要分享普通 debug 日志或数据库文件。
 
+schema v2 会额外记录 count-token、3xx、普通 4xx、send failure、in-flight 以及 telemetry registered/completed/batched/pending-timeout 等计数。自动遥测的 success token、cache、cost、duration、TTFT、request ID 和 stop reason 来自真实上游响应解析，不再随机生成。
+
 ---
 
 ## 架构概览

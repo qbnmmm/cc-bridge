@@ -20,7 +20,8 @@ use crate::service::fingerprint_audit::{
     FingerprintAudit, FingerprintMismatch, request_observation,
 };
 use crate::service::rewriter::{
-    ClientType, Rewriter, clean_session_id_from_body, detect_client_type,
+    ClientType, MessageEndpoint, Rewriter, classify_message_endpoint, clean_session_id_from_body,
+    detect_client_type,
 };
 use crate::service::telemetry::TelemetryService;
 use crate::service::usage::{UsageAttempt, UsageContentEncoding, UsageService};
@@ -296,7 +297,8 @@ impl GatewayService {
             .unwrap_or(false);
         cp!("rewrite");
 
-        if path.starts_with("/v1/messages") {
+        let message_endpoint = classify_message_endpoint(&path);
+        if message_endpoint == MessageEndpoint::Inference {
             let audit = build_fingerprint_observation(
                 &account,
                 client_type,
@@ -307,29 +309,45 @@ impl GatewayService {
                 is_stream,
             );
             self.fingerprint_audit.observe_request(audit);
+        } else if message_endpoint == MessageEndpoint::CountTokens {
+            self.fingerprint_audit.observe_count_tokens(account.id);
         }
 
-        let upstream_token = self
-            .account_svc
-            .resolve_upstream_token_with(&account)
-            .await?;
-        if path.starts_with("/v1/messages") && account.auto_telemetry {
-            let profile = crate::service::telemetry::TelemetryRequestProfile::from_request(
-                &final_model,
-                &rewritten_headers,
-                &rewritten_body_map,
-                client_type,
-            );
-            self.telemetry_svc
-                .activate_session(&account, upstream_token.clone(), profile)
-                .await;
-        }
-        let mut final_headers = rewritten_headers;
-        final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
-        let usage_attempt = (path == "/v1/messages")
+        let upstream_token = match self.account_svc.resolve_upstream_token_with(&account).await {
+            Ok(token) => token,
+            Err(error) => {
+                if message_endpoint == MessageEndpoint::Inference {
+                    self.fingerprint_audit.observe_send_failed(account.id);
+                }
+                return Err(error);
+            }
+        };
+        let mut usage_attempt = (message_endpoint == MessageEndpoint::Inference)
             .then(|| api_token)
             .flatten()
             .map(|token| UsageAttempt::begin(account.id, token.id, final_model.clone(), is_stream));
+        if account.auto_telemetry {
+            if let Some(attempt) = usage_attempt.as_mut() {
+                attempt.telemetry_enabled = true;
+                let profile = crate::service::telemetry::TelemetryRequestProfile::from_request(
+                    &final_model,
+                    &rewritten_headers,
+                    &rewritten_body_map,
+                    client_type,
+                );
+                self.telemetry_svc
+                    .activate_session(
+                        &account,
+                        upstream_token.clone(),
+                        attempt.attempt_id.clone(),
+                        attempt.occurred_at_utc,
+                        profile,
+                    )
+                    .await;
+            }
+        }
+        let mut final_headers = rewritten_headers;
+        final_headers.insert("authorization".into(), format!("Bearer {}", upstream_token));
         cp!("resolve_token");
 
         let resp = self
@@ -427,10 +445,25 @@ impl GatewayService {
         perf_log(rid, "forward_prep", tls_t0.elapsed().as_secs_f64() * 1000.0);
 
         let send_t0 = Instant::now();
-        let resp = req_builder.send().await.map_err(|e| {
-            warn!("upstream error for account {}: {}", account.id, e);
-            AppError::BadGateway("upstream request failed".into())
-        })?;
+        let correlation_id = usage_attempt
+            .as_ref()
+            .filter(|attempt| attempt.telemetry_enabled)
+            .map(|attempt| attempt.attempt_id.clone());
+        let resp = match req_builder.send().await {
+            Ok(resp) => resp,
+            Err(error) => {
+                warn!("upstream error for account {}: {}", account.id, error);
+                if correlation_id.is_some() {
+                    self.fingerprint_audit.observe_send_failed(account.id);
+                }
+                if let Some(correlation_id) = correlation_id {
+                    self.telemetry_svc
+                        .cancel_request(account.id, &correlation_id)
+                        .await;
+                }
+                return Err(AppError::BadGateway("upstream request failed".into()));
+            }
+        };
         perf_log(
             rid,
             "upstream_send_ttfb",
@@ -438,8 +471,10 @@ impl GatewayService {
         );
 
         let status_code = resp.status().as_u16();
-        self.fingerprint_audit
-            .observe_response(account.id, status_code);
+        if usage_attempt.is_some() {
+            self.fingerprint_audit
+                .observe_response(account.id, status_code);
+        }
         if let Some(attempt) = usage_attempt.as_mut() {
             attempt.is_stream = usage_response_is_stream(resp.headers(), attempt.is_stream);
             attempt.complete_response(

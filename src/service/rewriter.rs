@@ -59,6 +59,21 @@ pub enum ClientType {
     API,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageEndpoint {
+    Inference,
+    CountTokens,
+    Other,
+}
+
+pub fn classify_message_endpoint(path: &str) -> MessageEndpoint {
+    match path {
+        "/v1/messages" => MessageEndpoint::Inference,
+        "/v1/messages/count_tokens" => MessageEndpoint::CountTokens,
+        _ => MessageEndpoint::Other,
+    }
+}
+
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
 fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
     let mut seen = std::collections::HashSet::new();
@@ -109,10 +124,13 @@ pub fn compute_betas_for_request(model_id: &str, body: &serde_json::Value) -> Ve
     let lower = base.to_ascii_lowercase();
     let is_haiku = lower.contains("haiku");
     let is_claude3 = lower.contains("claude-3-");
-    let is_claude4_plus = lower.contains("claude-opus-4")
-        || lower.contains("claude-sonnet-4")
-        || lower.contains("claude-sonnet-5")
-        || lower.contains("claude-haiku-4");
+    let supports_context_management = !is_claude3
+        && (lower.contains("claude-opus-4")
+            || lower.contains("claude-opus-5")
+            || lower.contains("claude-sonnet-4")
+            || lower.contains("claude-sonnet-5")
+            || lower.contains("claude-haiku-4")
+            || lower.contains("claude-fable-5"));
     let has_thinking = request_has_active_thinking(body);
     let has_effort = request_has_effort(body);
 
@@ -131,12 +149,12 @@ pub fn compute_betas_for_request(model_id: &str, body: &serde_json::Value) -> Ve
     if has_thinking {
         out.push("thinking-token-count-2026-05-13");
     }
-    if is_claude4_plus {
+    if supports_context_management {
         out.push("context-management-2025-06-27");
     }
     out.push("prompt-caching-scope-2026-01-05");
     // 2.1.258 Haiku emits claude-code after prompt caching rather than omitting it.
-    if is_haiku && is_claude4_plus {
+    if is_haiku && supports_context_management {
         out.push("claude-code-20250219");
     }
     if has_effort && !is_haiku {
@@ -369,7 +387,9 @@ impl Rewriter {
         let mut output = serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec());
 
         // Rewrite 模式下对 /v1/messages 请求计算 cch attestation
-        if path.starts_with("/v1/messages") && account.billing_mode == BillingMode::Rewrite {
+        if classify_message_endpoint(path) == MessageEndpoint::Inference
+            && account.billing_mode == BillingMode::Rewrite
+        {
             output = compute_cch_attestation(output);
         }
 
@@ -1319,8 +1339,9 @@ fn stainless_os_from_platform(platform: &str) -> &str {
 #[cfg(test)]
 mod beta_tests {
     use super::{
-        compute_betas_for_model, compute_betas_for_request, merge_anthropic_beta,
-        rewrite_claude_user_agent, strip_1m_suffix,
+        MessageEndpoint, classify_message_endpoint, compute_betas_for_model,
+        compute_betas_for_request, merge_anthropic_beta, rewrite_claude_user_agent,
+        strip_1m_suffix,
     };
 
     fn contains(set: &[&str], value: &str) -> bool {
@@ -1398,6 +1419,32 @@ mod beta_tests {
             rewrite_claude_user_agent("claude-cli/9.9.9 (external, cli)", "2.1.258"),
             "claude-cli/2.1.258 (external, cli)"
         );
+    }
+
+    #[test]
+    fn exact_message_endpoint_classification_separates_count_tokens() {
+        assert_eq!(
+            classify_message_endpoint("/v1/messages"),
+            MessageEndpoint::Inference
+        );
+        assert_eq!(
+            classify_message_endpoint("/v1/messages/count_tokens"),
+            MessageEndpoint::CountTokens
+        );
+        assert_eq!(
+            classify_message_endpoint("/v1/messages/other"),
+            MessageEndpoint::Other
+        );
+    }
+
+    #[test]
+    fn modern_opus_and_fable_support_context_management() {
+        for model in ["claude-opus-5", "claude-fable-5-1", "claude-sonnet-5"] {
+            assert!(
+                compute_betas_for_model(model).contains(&"context-management-2025-06-27"),
+                "{model}"
+            );
+        }
     }
 
     #[test]

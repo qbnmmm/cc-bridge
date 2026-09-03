@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use crate::model::account::{Account, CanonicalEnvData, CanonicalProcessData};
 use crate::service::fingerprint_audit::FingerprintAudit;
 use crate::service::rewriter::ClientType;
+use crate::service::usage::CompletedInferenceObservation;
 use crate::store::account_store::AccountStore;
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,8 @@ const EVENT_BATCH_INTERVAL: Duration = Duration::from_secs(10);
 const GROWTHBOOK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const METRICS_INTERVAL: Duration = Duration::from_secs(60);
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
+const PENDING_HARD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const EVENT_BATCH_MAX_COMPLETIONS: usize = 64;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
 const GROWTHBOOK_CLIENT_KEY: &str = "sdk-zAZezfDKGoZuXXKe";
@@ -60,20 +63,17 @@ struct TelemetrySession {
     expires_at: Instant,
     expires_at_utc: chrono::DateTime<Utc>,
     last_event_batch_at: Instant,
-    last_growthbook_at: Option<Instant>,
     last_metrics_at: Instant,
     send_count: i64,
     running: bool,
-    /// 最近一次 /v1/messages 的真实请求画像，用于构造一致的 query/success telemetry。
-    request_profile: TelemetryRequestProfile,
+    pending: HashMap<String, PendingTelemetryRequest>,
+    ready: VecDeque<CompletedTelemetryEvent>,
     /// 累积 CPU 用户态微秒数（模拟 process.cpuUsage().user，严格单调递增）。
     cpu_user_total: i64,
     /// 累积 CPU 系统态微秒数（模拟 process.cpuUsage().system）。
     cpu_system_total: i64,
     /// 上次更新 CPU 字段时的 wall time，用于计算 cpuPercent。
     last_cpu_update: Instant,
-    /// 待发送事件数 — 由 activate_session 递增，telemetry_loop 消费，避免固定心跳。
-    pending_events: i32,
     /// 下次 event_batch 允许发送的时间点（用于抖动）。
     next_event_allowed_at: Instant,
     /// 遥测 session_id — 对标真实 CC `bootstrap/state.ts:331` 的 `randomUUID()`：
@@ -98,6 +98,19 @@ struct TelemetrySession {
     startup_sent: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingTelemetryRequest {
+    profile: TelemetryRequestProfile,
+    request_timestamp: chrono::DateTime<Utc>,
+    registered_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedTelemetryEvent {
+    pending: PendingTelemetryRequest,
+    observation: CompletedInferenceObservation,
+}
+
 // ---------------------------------------------------------------------------
 // TelemetryService
 // ---------------------------------------------------------------------------
@@ -112,6 +125,7 @@ pub struct TelemetryRequestProfile {
     pub thinking_type: Option<String>,
     pub effort: Option<String>,
     pub fast_mode: bool,
+    pub message_count: i64,
 }
 
 impl TelemetryRequestProfile {
@@ -160,6 +174,11 @@ impl TelemetryRequestProfile {
                     .split(',')
                     .any(|beta| beta.trim() == "fast-mode-2026-02-01")
             }),
+            message_count: body
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .map(|messages| i64::try_from(messages.len()).unwrap_or(i64::MAX))
+                .unwrap_or(0),
         }
     }
 }
@@ -169,14 +188,36 @@ pub struct TelemetryService {
     sessions: Arc<Mutex<HashMap<i64, TelemetrySession>>>,
     account_store: Arc<AccountStore>,
     fingerprint_audit: Arc<FingerprintAudit>,
+    growthbook_attempts: Arc<Mutex<HashMap<i64, Instant>>>,
 }
 
 impl TelemetryService {
-    pub fn new(account_store: Arc<AccountStore>, fingerprint_audit: Arc<FingerprintAudit>) -> Self {
+    pub fn new(
+        account_store: Arc<AccountStore>,
+        fingerprint_audit: Arc<FingerprintAudit>,
+        completion_receiver: tokio::sync::mpsc::Receiver<CompletedInferenceObservation>,
+    ) -> Self {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let completion_sessions = sessions.clone();
+        let completion_audit = fingerprint_audit.clone();
+        tokio::spawn(async move {
+            completion_loop(completion_sessions, completion_audit, completion_receiver).await;
+        });
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
             account_store,
             fingerprint_audit,
+            growthbook_attempts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn cancel_request(&self, account_id: i64, correlation_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&account_id) {
+            if session.pending.remove(correlation_id).is_some() {
+                self.fingerprint_audit
+                    .observe_telemetry(account_id, "cancelled", false);
+            }
         }
     }
 
@@ -186,12 +227,13 @@ impl TelemetryService {
         sessions.get(&account_id).map(|s| s.expires_at_utc)
     }
 
-    /// 当 /v1/messages 请求到来时调用，激活或续期遥测会话。
-    /// 同时每次调用都会把 pending_events += 1，让 telemetry_loop 驱动事件发送。
+    /// 注册一次真实 /v1/messages 请求；完成结果由 UsageService 异步回填。
     pub async fn activate_session(
         &self,
         account: &Account,
         token: String,
+        correlation_id: String,
+        request_timestamp: chrono::DateTime<Utc>,
         request_profile: TelemetryRequestProfile,
     ) {
         if !account.auto_telemetry {
@@ -207,8 +249,16 @@ impl TelemetryService {
             session.expires_at_utc = Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap();
             session.token = token;
             session.account = account.clone();
-            session.request_profile = request_profile;
-            session.pending_events = session.pending_events.saturating_add(1);
+            session.pending.insert(
+                correlation_id,
+                PendingTelemetryRequest {
+                    profile: request_profile,
+                    request_timestamp,
+                    registered_at: now,
+                },
+            );
+            self.fingerprint_audit
+                .observe_telemetry(account.id, "registered", true);
             debug!("telemetry: renewed session for account {}", account.id);
             return;
         }
@@ -224,6 +274,18 @@ impl TelemetryService {
         } else {
             request_profile
         };
+
+        let mut pending = HashMap::new();
+        pending.insert(
+            correlation_id,
+            PendingTelemetryRequest {
+                profile: request_profile,
+                request_timestamp,
+                registered_at: now,
+            },
+        );
+        self.fingerprint_audit
+            .observe_telemetry(account.id, "registered", true);
 
         // 初始化内存基线（从账号 preset 的区间随机取一个点作为起点）
         let proc_preset: CanonicalProcessData =
@@ -250,15 +312,14 @@ impl TelemetryService {
             expires_at: now + SESSION_TTL,
             expires_at_utc: Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap(),
             last_event_batch_at: now - EVENT_BATCH_INTERVAL, // 立即触发首次
-            last_growthbook_at: None,
             last_metrics_at: now - METRICS_INTERVAL,
             send_count: 0,
             running: true,
-            request_profile,
+            pending,
+            ready: VecDeque::new(),
             cpu_user_total: 0,
             cpu_system_total: 0,
             last_cpu_update: now,
-            pending_events: 1,
             next_event_allowed_at: now,
             telemetry_session_id: uuid::Uuid::new_v4().to_string(),
             uptime_offset_secs: uptime_offset,
@@ -276,12 +337,44 @@ impl TelemetryService {
         let sessions_ref = self.sessions.clone();
         let store_ref = self.account_store.clone();
         let audit_ref = self.fingerprint_audit.clone();
+        let growthbook_attempts = self.growthbook_attempts.clone();
         let account_id = account.id;
         let proxy_url = account.proxy_url.clone();
 
         tokio::spawn(async move {
-            telemetry_loop(sessions_ref, store_ref, audit_ref, account_id, proxy_url).await;
+            telemetry_loop(
+                sessions_ref,
+                store_ref,
+                audit_ref,
+                growthbook_attempts,
+                account_id,
+                proxy_url,
+            )
+            .await;
         });
+    }
+}
+
+async fn completion_loop(
+    sessions: Arc<Mutex<HashMap<i64, TelemetrySession>>>,
+    fingerprint_audit: Arc<FingerprintAudit>,
+    mut receiver: tokio::sync::mpsc::Receiver<CompletedInferenceObservation>,
+) {
+    while let Some(observation) = receiver.recv().await {
+        let mut sessions = sessions.lock().await;
+        let Some(session) = sessions.get_mut(&observation.account_id) else {
+            continue;
+        };
+        let Some(pending) = session.pending.remove(&observation.correlation_id) else {
+            continue;
+        };
+        fingerprint_audit.observe_telemetry(observation.account_id, "completed", true);
+        if observation.tokens.is_some() && (200..300).contains(&observation.http_status) {
+            session.ready.push_back(CompletedTelemetryEvent {
+                pending,
+                observation,
+            });
+        }
     }
 }
 
@@ -289,10 +382,34 @@ impl TelemetryService {
 // 后台循环
 // ---------------------------------------------------------------------------
 
+fn expire_stale_pending(
+    pending: &mut HashMap<String, PendingTelemetryRequest>,
+    now: Instant,
+) -> usize {
+    let before = pending.len();
+    pending.retain(|_, request| now.duration_since(request.registered_at) < PENDING_HARD_TIMEOUT);
+    before.saturating_sub(pending.len())
+}
+
+fn mark_growthbook_attempt(
+    attempts: &mut HashMap<i64, Instant>,
+    account_id: i64,
+    now: Instant,
+) -> bool {
+    let due = attempts
+        .get(&account_id)
+        .is_none_or(|last| now.duration_since(*last) >= GROWTHBOOK_INTERVAL);
+    if due {
+        attempts.insert(account_id, now);
+    }
+    due
+}
+
 async fn telemetry_loop(
     sessions: Arc<Mutex<HashMap<i64, TelemetrySession>>>,
     store: Arc<AccountStore>,
     fingerprint_audit: Arc<FingerprintAudit>,
+    growthbook_attempts: Arc<Mutex<HashMap<i64, Instant>>>,
     account_id: i64,
     proxy_url: String,
 ) {
@@ -307,8 +424,17 @@ async fn telemetry_loop(
             None => break,
         };
 
-        // TTL 过期 → 持久化计数并退出
-        if Instant::now() >= session.expires_at {
+        let now = Instant::now();
+        let timed_out = expire_stale_pending(&mut session.pending, now);
+        for _ in 0..timed_out {
+            fingerprint_audit.observe_telemetry(account_id, "pending_timed_out", false);
+        }
+
+        // 空闲且没有待完成/待发送事件时才结束 session。
+        if Instant::now() >= session.expires_at
+            && session.pending.is_empty()
+            && session.ready.is_empty()
+        {
             let count = session.send_count;
             let account = session.account.clone();
             session.running = false;
@@ -326,7 +452,7 @@ async fn telemetry_loop(
 
         // --- event_logging/batch ---
         // 仅当有待发送事件 + 已过最小间隔 + 超过抖动的允许发送时间
-        if session.pending_events > 0
+        if !session.ready.is_empty()
             && now.duration_since(session.last_event_batch_at) >= EVENT_BATCH_INTERVAL
             && now >= session.next_event_allowed_at
         {
@@ -387,10 +513,14 @@ async fn telemetry_loop(
             let emit_startup = !session.startup_sent;
             session.startup_sent = true;
 
+            let completions: Vec<_> = (0..EVENT_BATCH_MAX_COMPLETIONS)
+                .filter_map(|_| session.ready.pop_front())
+                .collect();
+            let completion_count = completions.len();
             let payload = build_event_batch(EventBatchCtx {
                 account: &session.account,
                 uptime_secs,
-                profile: session.request_profile.clone(),
+                completions,
                 cpu_user_total: session.cpu_user_total,
                 cpu_system_total: session.cpu_system_total,
                 cpu_percent,
@@ -412,7 +542,6 @@ async fn telemetry_loop(
             session.last_event_batch_at = now;
             session.send_count += 1;
             session.events_sent_total += event_count;
-            session.pending_events -= 1;
             // 下次发送加 3–12s 抖动，避免固定周期
             session.next_event_allowed_at = now + Duration::from_secs(jitter_secs);
             drop(map);
@@ -426,6 +555,9 @@ async fn telemetry_loop(
             )
             .await;
             fingerprint_audit.observe_telemetry(account_id, "event_batch", success);
+            for _ in 0..completion_count {
+                fingerprint_audit.observe_telemetry(account_id, "batched", success);
+            }
             if success {
                 let _ = store.increment_telemetry_count(account_id, 1).await;
             }
@@ -433,15 +565,14 @@ async fn telemetry_loop(
         }
 
         // --- GrowthBook eval ---
-        let should_gb = match session.last_growthbook_at {
-            None => true,
-            Some(t) => now.duration_since(t) >= GROWTHBOOK_INTERVAL,
+        let should_gb = {
+            let mut attempts = growthbook_attempts.lock().await;
+            mark_growthbook_attempt(&mut attempts, account_id, now)
         };
         if should_gb {
             let payload = build_growthbook_eval(&session.account);
             let token = session.token.clone();
             let c = client.clone();
-            session.last_growthbook_at = Some(now);
             session.send_count += 1;
             drop(map);
 
@@ -638,7 +769,7 @@ fn compute_build_age_minutes(build_time: &str) -> Option<i64> {
 struct EventBatchCtx<'a> {
     account: &'a Account,
     uptime_secs: f64,
-    profile: TelemetryRequestProfile,
+    completions: Vec<CompletedTelemetryEvent>,
     cpu_user_total: i64,
     cpu_system_total: i64,
     cpu_percent: f64,
@@ -662,155 +793,132 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
     let env = parse_env(ctx.account);
     let proc = parse_process(ctx.account);
     let account_uuid = derive_account_uuid(ctx.account);
-
-    let process_b64 = {
-        let p = build_process_json(
-            &proc,
-            ctx.uptime_secs,
-            ctx.mem_rss,
-            ctx.mem_heap_total,
-            ctx.mem_heap_used,
-            ctx.mem_external,
-            ctx.mem_array_buffers,
-            ctx.cpu_user_total,
-            ctx.cpu_system_total,
-            ctx.cpu_percent,
-        );
-        let bytes = serde_json::to_vec(&p).unwrap_or_default();
-        base64::engine::general_purpose::STANDARD.encode(&bytes)
-    };
-
+    let process = build_process_json(
+        &proc,
+        ctx.uptime_secs,
+        ctx.mem_rss,
+        ctx.mem_heap_total,
+        ctx.mem_heap_used,
+        ctx.mem_external,
+        ctx.mem_array_buffers,
+        ctx.cpu_user_total,
+        ctx.cpu_system_total,
+        ctx.cpu_percent,
+    );
+    let process_b64 = base64::engine::general_purpose::STANDARD
+        .encode(serde_json::to_vec(&process).unwrap_or_default());
     let env_obj = build_full_env(&env);
-
-    let mut auth = json!({});
-    auth["account_uuid"] = json!(account_uuid);
+    let mut auth = json!({"account_uuid": account_uuid});
     if let Some(ref org) = ctx.account.organization_uuid {
         auth["organization_uuid"] = json!(org);
     }
-
-    // betas: 使用 rewriter 对同一模型计算出的真实 beta 列表
-    let betas = ctx.profile.betas.clone();
     let build_age_mins = compute_build_age_minutes(&env.build_time);
 
-    // tengu_api_success 的典型载荷 — 合理随机
-    let mut rng = rand::thread_rng();
-    let input_tokens: i64 = rng.gen_range(500i64..8000);
-    let output_tokens: i64 = rng.gen_range(100i64..2000);
-    let cached_input: i64 = rng.gen_range(0i64..input_tokens);
-    let uncached_input: i64 = (input_tokens - cached_input).max(0);
-    let duration_ms: i64 = rng.gen_range(800i64..6000);
-    let ttft_ms: i64 = rng.gen_range(200i64..1500);
-    let message_count: i64 = rng.gen_range(1i64..20);
-    let message_tokens: i64 = input_tokens + output_tokens;
-    let cost_usd: f64 = (input_tokens as f64 * 0.000003) + (output_tokens as f64 * 0.000015);
-    let request_id = format!(
-        "req_{}",
-        uuid::Uuid::new_v4().simple().to_string()[..24].to_string()
-    );
-    drop(rng);
-
-    // 统一的事件框架字段：任何 event_data 都带
-    let make_base = |event_name: &'static str, process_b64: &str| -> serde_json::Value {
-        let mut ev = json!({
+    let make_base = |name: &str,
+                     timestamp: chrono::DateTime<Utc>,
+                     profile: &TelemetryRequestProfile|
+     -> serde_json::Value {
+        let mut event = json!({
             "event_id": uuid::Uuid::new_v4().to_string(),
-            "event_name": event_name,
-            "client_timestamp": js_iso_timestamp(),
+            "event_name": name,
+            "client_timestamp": timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "device_id": ctx.account.device_id,
             "email": ctx.account.email,
             "session_id": ctx.session_id,
             "user_type": "external",
-            "is_interactive": ctx.profile.is_interactive,
-            "client_type": ctx.profile.client_type,
-            "entrypoint": ctx.profile.entrypoint,
+            "is_interactive": profile.is_interactive,
+            "client_type": profile.client_type,
+            "entrypoint": profile.entrypoint,
             "auth": auth.clone(),
             "env": env_obj.clone(),
             "process": process_b64,
         });
-        if let (Some(map), Some(mins)) = (ev.as_object_mut(), build_age_mins) {
-            map.insert("buildAgeMins".into(), json!(mins));
+        if let (Some(map), Some(age)) = (event.as_object_mut(), build_age_mins) {
+            map.insert("buildAgeMins".into(), json!(age));
         }
-        ev
+        event
     };
-
-    let wrap = |event_data: serde_json::Value| -> serde_json::Value {
-        json!({
-            "event_type": "ClaudeCodeInternalEvent",
-            "event_data": event_data,
-        })
-    };
-
-    let mut events: Vec<serde_json::Value> = Vec::new();
-
-    // --- tengu_startup（会话首个 batch）---
+    let wrap = |event_data| json!({"event_type":"ClaudeCodeInternalEvent","event_data":event_data});
+    let mut events = Vec::new();
     if ctx.emit_startup {
-        let mut ev = make_base("tengu_startup", &process_b64);
-        if let Some(m) = ev.as_object_mut() {
-            m.insert("model".into(), json!(ctx.profile.model));
-            m.insert("provider".into(), json!("firstParty"));
-            m.insert("isFirstSession".into(), json!(true));
-            m.insert("querySource".into(), json!("user"));
-        }
-        events.push(wrap(ev));
-    }
-
-    // --- tengu_api_query ---（对应源码 logging.ts:196）
-    {
-        let mut ev = make_base("tengu_api_query", &process_b64);
-        if let Some(m) = ev.as_object_mut() {
-            m.insert("model".into(), json!(ctx.profile.model));
-            m.insert("messagesLength".into(), json!(message_count));
-            m.insert("temperature".into(), json!(1.0));
-            m.insert("provider".into(), json!("firstParty"));
-            m.insert("betas".into(), json!(betas));
-            m.insert("permissionMode".into(), json!("default"));
-            m.insert("querySource".into(), json!("user"));
-            if let Some(ref thinking_type) = ctx.profile.thinking_type {
-                m.insert("thinkingType".into(), json!(thinking_type));
-            }
-            if let Some(ref effort) = ctx.profile.effort {
-                m.insert("effortValue".into(), json!(effort));
-            }
-            m.insert("fastMode".into(), json!(ctx.profile.fast_mode));
-        }
-        events.push(wrap(ev));
-    }
-
-    // --- tengu_api_success ---（对应源码 logging.ts:463-520）
-    {
-        let mut ev = make_base("tengu_api_success", &process_b64);
-        if let Some(m) = ev.as_object_mut() {
-            m.insert("model".into(), json!(ctx.profile.model));
-            m.insert("betas".into(), json!(betas));
-            m.insert("messageCount".into(), json!(message_count));
-            m.insert("messageTokens".into(), json!(message_tokens));
-            m.insert("inputTokens".into(), json!(input_tokens));
-            m.insert("outputTokens".into(), json!(output_tokens));
-            m.insert("cachedInputTokens".into(), json!(cached_input));
-            m.insert("uncachedInputTokens".into(), json!(uncached_input));
-            m.insert("durationMs".into(), json!(duration_ms));
-            m.insert("durationMsIncludingRetries".into(), json!(duration_ms));
-            m.insert("attempt".into(), json!(1));
-            m.insert("ttftMs".into(), json!(ttft_ms));
-            m.insert("requestId".into(), json!(request_id));
-            m.insert("stop_reason".into(), json!("end_turn"));
-            m.insert("costUSD".into(), json!(cost_usd));
-            m.insert("didFallBackToNonStreaming".into(), json!(false));
-            m.insert(
-                "isNonInteractiveSession".into(),
-                json!(!ctx.profile.is_interactive),
+        if let Some(first) = ctx.completions.first() {
+            let mut event = make_base(
+                "tengu_startup",
+                first.pending.request_timestamp,
+                &first.pending.profile,
             );
-            m.insert("print".into(), json!(ctx.profile.entrypoint == "sdk-cli"));
-            m.insert("isTTY".into(), json!(ctx.profile.is_interactive));
-            m.insert("querySource".into(), json!("user"));
-            m.insert("provider".into(), json!("firstParty"));
-            if let Some(ref effort) = ctx.profile.effort {
-                m.insert("effort_level".into(), json!(effort));
-            }
+            event["model"] = json!(first.pending.profile.model);
+            event["provider"] = json!("firstParty");
+            event["isFirstSession"] = json!(true);
+            event["querySource"] = json!("user");
+            events.push(wrap(event));
         }
-        events.push(wrap(ev));
     }
+    for completed in &ctx.completions {
+        let profile = &completed.pending.profile;
+        let observation = &completed.observation;
+        let mut query = make_base(
+            "tengu_api_query",
+            completed.pending.request_timestamp,
+            profile,
+        );
+        query["model"] = json!(profile.model);
+        query["messagesLength"] = json!(profile.message_count);
+        query["provider"] = json!("firstParty");
+        query["betas"] = json!(profile.betas);
+        query["permissionMode"] = json!("default");
+        query["querySource"] = json!("user");
+        query["fastMode"] = json!(profile.fast_mode);
+        if let Some(ref value) = profile.thinking_type {
+            query["thinkingType"] = json!(value);
+        }
+        if let Some(ref value) = profile.effort {
+            query["effortValue"] = json!(value);
+        }
+        events.push(wrap(query));
 
-    json!({ "events": events })
+        let mut success = make_base("tengu_api_success", observation.completed_at_utc, profile);
+        success["model"] = json!(observation.model);
+        success["betas"] = json!(profile.betas);
+        success["messageCount"] = json!(profile.message_count);
+        if let Some(tokens) = &observation.tokens {
+            success["inputTokens"] = json!(tokens.input);
+            success["outputTokens"] = json!(tokens.output);
+            success["cachedInputTokens"] = json!(tokens.cache_read);
+            success["uncachedInputTokens"] = json!(
+                tokens
+                    .input
+                    .saturating_add(tokens.cache_creation_5m)
+                    .saturating_add(tokens.cache_creation_1h)
+            );
+        }
+        success["durationMs"] = json!(observation.duration_ms);
+        success["durationMsIncludingRetries"] = json!(observation.duration_ms);
+        success["attempt"] = json!(1);
+        if let Some(ttft) = observation.ttft_ms {
+            success["ttftMs"] = json!(ttft);
+        }
+        if let Some(ref request_id) = observation.upstream_request_id {
+            success["requestId"] = json!(request_id);
+        }
+        if let Some(ref reason) = observation.stop_reason {
+            success["stop_reason"] = json!(reason);
+        }
+        if let Some(cost) = observation.cost_nano_usd {
+            success["costUSD"] = json!(cost as f64 / 1_000_000_000.0);
+        }
+        success["isNonInteractiveSession"] = json!(!profile.is_interactive);
+        success["print"] = json!(profile.entrypoint == "sdk-cli");
+        success["isTTY"] = json!(profile.is_interactive);
+        success["querySource"] = json!("user");
+        success["provider"] = json!("firstParty");
+        success["clientDropped"] = json!(observation.client_dropped);
+        if let Some(ref effort) = profile.effort {
+            success["effort_level"] = json!(effort);
+        }
+        events.push(wrap(success));
+    }
+    json!({"events": events})
 }
 
 /// 构造 /api/eval/{clientKey} 请求体（GrowthBook remote eval）。
@@ -965,16 +1073,45 @@ mod tests {
         EventBatchCtx {
             account,
             uptime_secs: 42.0,
-            profile: TelemetryRequestProfile {
-                model: model.into(),
-                betas: crate::service::rewriter::compute_betas_for_request(model, &body).join(","),
-                entrypoint: "cli".into(),
-                client_type: "cli".into(),
-                is_interactive: true,
-                thinking_type: None,
-                effort: None,
-                fast_mode: false,
-            },
+            completions: vec![CompletedTelemetryEvent {
+                pending: PendingTelemetryRequest {
+                    profile: TelemetryRequestProfile {
+                        model: model.into(),
+                        betas: crate::service::rewriter::compute_betas_for_request(model, &body)
+                            .join(","),
+                        entrypoint: "cli".into(),
+                        client_type: "cli".into(),
+                        is_interactive: true,
+                        thinking_type: None,
+                        effort: None,
+                        fast_mode: false,
+                        message_count: 1,
+                    },
+                    request_timestamp: Utc::now(),
+                    registered_at: Instant::now(),
+                },
+                observation: CompletedInferenceObservation {
+                    correlation_id: "corr".into(),
+                    account_id: account.id,
+                    completed_at_utc: Utc::now(),
+                    model: model.into(),
+                    upstream_request_id: Some("req_1234567890abcdefghijklmn".into()),
+                    tokens: Some(crate::model::usage::UsageTokens {
+                        input: 100,
+                        output: 20,
+                        cache_creation_5m: 3,
+                        cache_creation_1h: 4,
+                        cache_read: 5,
+                    }),
+                    cost_nano_usd: Some(123_000_000),
+                    duration_ms: 900,
+                    ttft_ms: Some(200),
+                    stop_reason: Some("end_turn".into()),
+                    http_status: 200,
+                    is_stream: true,
+                    client_dropped: false,
+                },
+            }],
             cpu_user_total: cpu_user,
             cpu_system_total: cpu_system,
             cpu_percent: 0.3,
@@ -1259,7 +1396,6 @@ mod tests {
             "model",
             "betas",
             "messageCount",
-            "messageTokens",
             "inputTokens",
             "outputTokens",
             "cachedInputTokens",
@@ -1271,7 +1407,6 @@ mod tests {
             "requestId",
             "stop_reason",
             "costUSD",
-            "didFallBackToNonStreaming",
             "isNonInteractiveSession",
             "print",
             "isTTY",
@@ -1291,6 +1426,11 @@ mod tests {
         assert_eq!(data["event_name"].as_str(), Some("tengu_api_success"));
         assert_eq!(data["provider"].as_str(), Some("firstParty"));
         assert_eq!(data["attempt"].as_i64(), Some(1));
+        assert_eq!(data["inputTokens"], 100);
+        assert_eq!(data["outputTokens"], 20);
+        assert_eq!(data["durationMs"], 900);
+        assert_eq!(data["ttftMs"], 200);
+        assert_eq!(data["stop_reason"], "end_turn");
     }
 
     #[test]
@@ -1471,5 +1611,68 @@ mod tests {
             crate::model::identity::CLAUDE_CODE_VERSION
         );
         assert_eq!(attrs["os.version"], "Darwin 25.6.0");
+    }
+
+    #[test]
+    fn event_batch_contains_multiple_real_completion_pairs() {
+        let account = make_account();
+        let mut ctx = ctx_for(&account, "claude-opus-5", "sid", 0, 0, false);
+        let mut second = ctx.completions[0].clone();
+        second.observation.model = "claude-sonnet-5".into();
+        second.observation.tokens.as_mut().unwrap().input = 777;
+        second.observation.upstream_request_id = Some("req_second_12345678901234567890".into());
+        ctx.completions.push(second);
+        let batch = build_event_batch(ctx);
+        let events = batch["events"].as_array().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event_data"]["event_name"] == "tengu_api_query")
+                .count(),
+            2
+        );
+        let successes: Vec<_> = events
+            .iter()
+            .filter(|event| event["event_data"]["event_name"] == "tengu_api_success")
+            .collect();
+        assert_eq!(successes.len(), 2);
+        assert_eq!(successes[1]["event_data"]["inputTokens"], 777);
+        assert_eq!(
+            successes[1]["event_data"]["requestId"],
+            "req_second_12345678901234567890"
+        );
+    }
+
+    #[test]
+    fn growthbook_throttle_survives_session_restart() {
+        let start = Instant::now();
+        let mut attempts = HashMap::new();
+        assert!(mark_growthbook_attempt(&mut attempts, 1, start));
+        assert!(!mark_growthbook_attempt(
+            &mut attempts,
+            1,
+            start + Duration::from_secs(60)
+        ));
+        assert!(mark_growthbook_attempt(
+            &mut attempts,
+            1,
+            start + GROWTHBOOK_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn pending_hard_timeout_removes_only_stale_requests() {
+        let account = make_account();
+        let now = Instant::now();
+        let mut stale = ctx_for(&account, "claude-opus-5", "sid", 0, 0, false)
+            .completions
+            .remove(0)
+            .pending;
+        stale.registered_at = now - PENDING_HARD_TIMEOUT;
+        let mut fresh = stale.clone();
+        fresh.registered_at = now;
+        let mut pending = HashMap::from([("stale".into(), stale), ("fresh".into(), fresh)]);
+        assert_eq!(expire_stale_pending(&mut pending, now), 1);
+        assert!(pending.contains_key("fresh"));
     }
 }

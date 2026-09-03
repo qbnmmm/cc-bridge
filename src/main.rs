@@ -70,11 +70,28 @@ async fn main() {
         pool.clone(),
         driver.clone(),
     ));
+    let fingerprint_audit = service::fingerprint_audit::FingerprintAudit::start(
+        cfg.fingerprint_audit_enabled,
+        &cfg.log_dir,
+    );
+    if fingerprint_audit.is_enabled() {
+        info!(
+            "fingerprint audit enabled: {}/fingerprint-audit.jsonl",
+            cfg.log_dir
+        );
+    }
     let pricing = service::usage_pricing::PricingEngine::from_override_json(
         cfg.usage_pricing_overrides_json.as_deref(),
     )
     .expect("invalid usage pricing configuration");
-    let usage_svc = service::usage::UsageService::start(usage_store, pricing).await;
+    let (completion_sender, completion_receiver) = tokio::sync::mpsc::channel(4096);
+    let usage_svc = service::usage::UsageService::start_with_completion(
+        usage_store,
+        pricing,
+        completion_sender,
+        fingerprint_audit.clone(),
+    )
+    .await;
 
     // 一次性清理：Phase 1 之前旧限流路径写入的残留字段（status='active' 账号上的
     // rate_limited_at / rate_limit_reset_at / disable_reason）。幂等，每次启动执行。
@@ -91,19 +108,10 @@ async fn main() {
         limit_store.clone(),
     ));
     let rewriter = Arc::new(service::rewriter::Rewriter::new());
-    let fingerprint_audit = service::fingerprint_audit::FingerprintAudit::start(
-        cfg.fingerprint_audit_enabled,
-        &cfg.log_dir,
-    );
-    if fingerprint_audit.is_enabled() {
-        info!(
-            "fingerprint audit enabled: {}/fingerprint-audit.jsonl",
-            cfg.log_dir
-        );
-    }
     let telemetry_svc = Arc::new(service::telemetry::TelemetryService::new(
         account_store.clone(),
         fingerprint_audit.clone(),
+        completion_receiver,
     ));
     let gateway_svc = Arc::new(service::gateway::GatewayService::new(
         account_svc.clone(),

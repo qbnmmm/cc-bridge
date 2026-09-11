@@ -13,7 +13,7 @@ use tracing::warn;
 
 use crate::model::account::{Account, CanonicalEnvData};
 
-const AUDIT_SCHEMA_VERSION: u32 = 2;
+const AUDIT_SCHEMA_VERSION: u32 = 3;
 const AUDIT_FILE_NAME: &str = "fingerprint-audit.jsonl";
 const AUDIT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 const AUDIT_MAX_HISTORY_FILES: usize = 6;
@@ -114,6 +114,9 @@ enum AuditMessage {
     SendFailed {
         account_id: i64,
     },
+    CancelledBeforeResponse {
+        account_id: i64,
+    },
     Telemetry {
         account_id: i64,
         event_name: &'static str,
@@ -141,6 +144,7 @@ struct AccountCounters {
     status_4xx_other: u64,
     status_5xx: u64,
     send_failed: u64,
+    cancelled_before_response: u64,
     thinking_requests: u64,
     effort_requests: u64,
     session_id_present: u64,
@@ -151,6 +155,9 @@ struct AccountCounters {
     betas: BTreeMap<String, u64>,
     telemetry_events: BTreeMap<String, u64>,
     telemetry_failed: u64,
+    telemetry_send_failed: u64,
+    telemetry_pending_timed_out: u64,
+    telemetry_observation_dropped: u64,
     mismatches: BTreeMap<FingerprintMismatch, u64>,
 }
 
@@ -204,6 +211,7 @@ struct HourlySummaryRecord<'a> {
     status_4xx_other: u64,
     status_5xx: u64,
     send_failed: u64,
+    cancelled_before_response: u64,
     thinking_requests: u64,
     effort_requests: u64,
     session_id_present: u64,
@@ -214,6 +222,9 @@ struct HourlySummaryRecord<'a> {
     betas: &'a BTreeMap<String, u64>,
     telemetry_events: &'a BTreeMap<String, u64>,
     telemetry_failed: u64,
+    telemetry_send_failed: u64,
+    telemetry_pending_timed_out: u64,
+    telemetry_observation_dropped: u64,
     mismatches: &'a BTreeMap<FingerprintMismatch, u64>,
     dropped_audit_observations: u64,
     in_flight_at_end: u64,
@@ -222,6 +233,43 @@ struct HourlySummaryRecord<'a> {
 pub struct FingerprintAudit {
     sender: Option<mpsc::Sender<AuditMessage>>,
     dropped: Arc<AtomicU64>,
+}
+
+#[must_use = "Keep the audit guard until response headers or a send failure."]
+pub struct AuditRequestGuard<'a> {
+    audit: &'a FingerprintAudit,
+    account_id: i64,
+    active: bool,
+}
+
+impl AuditRequestGuard<'_> {
+    pub fn response(mut self, status: u16) {
+        self.finish(AuditMessage::Response {
+            account_id: self.account_id,
+            status,
+        });
+    }
+
+    pub fn send_failed(mut self) {
+        self.finish(AuditMessage::SendFailed {
+            account_id: self.account_id,
+        });
+    }
+
+    fn finish(&mut self, message: AuditMessage) {
+        if self.active {
+            self.active = false;
+            self.audit.try_send(message);
+        }
+    }
+}
+
+impl Drop for AuditRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.finish(AuditMessage::CancelledBeforeResponse {
+            account_id: self.account_id,
+        });
+    }
 }
 
 impl FingerprintAudit {
@@ -250,20 +298,18 @@ impl FingerprintAudit {
         self.sender.is_some()
     }
 
-    pub fn observe_request(&self, observation: AuditRequestObservation) {
-        self.try_send(AuditMessage::Request(observation));
-    }
-
-    pub fn observe_response(&self, account_id: i64, status: u16) {
-        self.try_send(AuditMessage::Response { account_id, status });
+    pub fn begin_request(&self, observation: AuditRequestObservation) -> AuditRequestGuard<'_> {
+        let account_id = observation.account_id;
+        let active = self.try_send(AuditMessage::Request(observation));
+        AuditRequestGuard {
+            audit: self,
+            account_id,
+            active,
+        }
     }
 
     pub fn observe_count_tokens(&self, account_id: i64) {
         self.try_send(AuditMessage::CountTokens { account_id });
-    }
-
-    pub fn observe_send_failed(&self, account_id: i64) {
-        self.try_send(AuditMessage::SendFailed { account_id });
     }
 
     pub fn observe_telemetry(&self, account_id: i64, event_name: &'static str, success: bool) {
@@ -283,13 +329,15 @@ impl FingerprintAudit {
         });
     }
 
-    fn try_send(&self, message: AuditMessage) {
+    fn try_send(&self, message: AuditMessage) -> bool {
         let Some(sender) = &self.sender else {
-            return;
+            return false;
         };
         if sender.try_send(message).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
+        true
     }
 }
 
@@ -417,6 +465,14 @@ fn apply_message(
             let current = in_flight.entry(account_id).or_default();
             *current = current.saturating_sub(1);
         }
+        AuditMessage::CancelledBeforeResponse { account_id } => {
+            counters
+                .entry(account_id)
+                .or_default()
+                .cancelled_before_response += 1;
+            let current = in_flight.entry(account_id).or_default();
+            *current = current.saturating_sub(1);
+        }
         AuditMessage::Telemetry {
             account_id,
             event_name,
@@ -428,7 +484,16 @@ fn apply_message(
                 .entry(event_name.into())
                 .or_default() += 1;
             if !success {
+                // Keep the legacy failed-observation total, including failed batch members.
                 counter.telemetry_failed += 1;
+                match event_name {
+                    "event_batch" | "growthbook_eval" | "metrics" => {
+                        counter.telemetry_send_failed += 1;
+                    }
+                    "pending_timed_out" => counter.telemetry_pending_timed_out += 1,
+                    "observation_dropped" => counter.telemetry_observation_dropped += 1,
+                    _ => {}
+                }
             }
         }
         AuditMessage::Session {
@@ -475,6 +540,7 @@ fn flush_summaries(
             status_4xx_other: counter.status_4xx_other,
             status_5xx: counter.status_5xx,
             send_failed: counter.send_failed,
+            cancelled_before_response: counter.cancelled_before_response,
             thinking_requests: counter.thinking_requests,
             effort_requests: counter.effort_requests,
             session_id_present: counter.session_id_present,
@@ -485,6 +551,9 @@ fn flush_summaries(
             betas: &counter.betas,
             telemetry_events: &counter.telemetry_events,
             telemetry_failed: counter.telemetry_failed,
+            telemetry_send_failed: counter.telemetry_send_failed,
+            telemetry_pending_timed_out: counter.telemetry_pending_timed_out,
+            telemetry_observation_dropped: counter.telemetry_observation_dropped,
             mismatches: &counter.mismatches,
             dropped_audit_observations: dropped,
             in_flight_at_end: *in_flight.get(account_id).unwrap_or(&0),
@@ -619,6 +688,54 @@ pub fn request_observation(
 mod tests {
     use super::*;
 
+    fn test_observation(auto_telemetry: bool) -> AuditRequestObservation {
+        AuditRequestObservation {
+            account_id: 1,
+            auth_type: "oauth".into(),
+            auto_telemetry,
+            profile: AuditProfile::from_env(&CanonicalEnvData::default()),
+            client_type: "claude_code".into(),
+            entrypoint: "cli".into(),
+            model: "claude-opus-5".into(),
+            stream: true,
+            thinking: Some("adaptive".into()),
+            effort: Some("high".into()),
+            betas: vec![],
+            session_id_present: true,
+            client_request_id_present: true,
+            mismatches: vec![],
+        }
+    }
+
+    fn test_audit(capacity: usize) -> (Arc<FingerprintAudit>, mpsc::Receiver<AuditMessage>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        (
+            Arc::new(FingerprintAudit {
+                sender: Some(sender),
+                dropped: Arc::new(AtomicU64::new(0)),
+            }),
+            receiver,
+        )
+    }
+
+    fn drain_counters(
+        receiver: &mut mpsc::Receiver<AuditMessage>,
+    ) -> (HashMap<i64, AccountCounters>, HashMap<i64, u64>) {
+        let mut counters = HashMap::new();
+        let mut profiles = HashMap::new();
+        let mut in_flight = HashMap::new();
+        while let Ok(message) = receiver.try_recv() {
+            apply_message(
+                &mut None,
+                &mut counters,
+                &mut profiles,
+                &mut in_flight,
+                message,
+            );
+        }
+        (counters, in_flight)
+    }
+
     #[test]
     fn audit_record_schema_cannot_hold_sensitive_payloads() {
         let profile = AuditProfile {
@@ -676,9 +793,134 @@ mod tests {
             sender: Some(sender),
             dropped: dropped.clone(),
         };
-        audit.observe_response(1, 200);
-        audit.observe_response(1, 200);
+        audit.observe_count_tokens(1);
+        audit.observe_count_tokens(1);
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn request_guard_records_one_outcome_independent_of_auto_telemetry() {
+        for auto_telemetry in [false, true] {
+            let (audit, mut receiver) = test_audit(16);
+            let response = audit.begin_request(test_observation(auto_telemetry));
+            let failed = audit.begin_request(test_observation(auto_telemetry));
+            let cancelled = audit.begin_request(test_observation(auto_telemetry));
+            failed.send_failed();
+            response.response(200);
+            drop(cancelled);
+            audit.observe_count_tokens(1);
+
+            let (counters, in_flight) = drain_counters(&mut receiver);
+            let counter = &counters[&1];
+            assert_eq!(counter.requests, 3);
+            assert_eq!(counter.status_2xx, 1);
+            assert_eq!(counter.send_failed, 1);
+            assert_eq!(counter.cancelled_before_response, 1);
+            assert_eq!(counter.count_token_requests, 1);
+            assert_eq!(in_flight[&1], 0);
+            assert_eq!(audit.dropped.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_request_future_closes_audit_without_waiting_for_timeout() {
+        let (audit, mut receiver) = test_audit(8);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task_audit = audit.clone();
+        let task = tokio::spawn(async move {
+            let _request = task_audit.begin_request(test_observation(true));
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let (counters, in_flight) = drain_counters(&mut receiver);
+        assert_eq!(counters[&1].requests, 1);
+        assert_eq!(counters[&1].cancelled_before_response, 1);
+        assert_eq!(counters[&1].send_failed, 0);
+        assert_eq!(in_flight[&1], 0);
+    }
+
+    #[tokio::test]
+    async fn aborting_after_response_headers_does_not_count_as_response_cancellation() {
+        let (audit, mut receiver) = test_audit(8);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task_audit = audit.clone();
+        let task = tokio::spawn(async move {
+            let request = task_audit.begin_request(test_observation(false));
+            request.response(429);
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let (counters, in_flight) = drain_counters(&mut receiver);
+        assert_eq!(counters[&1].status_429, 1);
+        assert_eq!(counters[&1].cancelled_before_response, 0);
+        assert_eq!(in_flight[&1], 0);
+    }
+
+    #[test]
+    fn dropped_request_observation_cannot_decrement_another_request() {
+        let (audit, mut receiver) = test_audit(1);
+        let accepted = audit.begin_request(test_observation(true));
+        let dropped = audit.begin_request(test_observation(true));
+        let (counters, in_flight) = drain_counters(&mut receiver);
+        assert_eq!(counters[&1].requests, 1);
+        assert_eq!(in_flight[&1], 1);
+
+        drop(dropped);
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(audit.dropped.load(Ordering::Relaxed), 1);
+        drop(accepted);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AuditMessage::CancelledBeforeResponse { account_id: 1 }
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_queue_during_cancellation_records_drop_without_blocking() {
+        let (audit, mut receiver) = test_audit(1);
+        let request = audit.begin_request(test_observation(true));
+        drop(request);
+        assert_eq!(audit.dropped.load(Ordering::Relaxed), 1);
+        let (counters, in_flight) = drain_counters(&mut receiver);
+        assert_eq!(counters[&1].requests, 1);
+        assert_eq!(counters[&1].cancelled_before_response, 0);
+        assert_eq!(in_flight[&1], 1);
+    }
+
+    #[test]
+    fn telemetry_failure_categories_count_http_requests_once() {
+        let (audit, mut receiver) = test_audit(32);
+        for event in ["event_batch", "growthbook_eval", "metrics"] {
+            audit.observe_telemetry(1, event, true);
+            audit.observe_telemetry(1, event, false);
+        }
+        for _ in 0..3 {
+            audit.observe_telemetry(1, "batched", false);
+        }
+        audit.observe_telemetry(1, "pending_timed_out", false);
+        audit.observe_telemetry(1, "pending_timed_out", false);
+        audit.observe_telemetry(1, "observation_dropped", false);
+        audit.observe_telemetry(1, "cancelled", false);
+        audit.observe_telemetry(1, "completed", true);
+
+        let (counters, _) = drain_counters(&mut receiver);
+        let counter = &counters[&1];
+        assert_eq!(counter.telemetry_send_failed, 3);
+        assert_eq!(counter.telemetry_pending_timed_out, 2);
+        assert_eq!(counter.telemetry_observation_dropped, 1);
+        assert_eq!(counter.telemetry_failed, 10);
+        assert_eq!(counter.telemetry_events["cancelled"], 1);
+        assert_eq!(counter.telemetry_events["batched"], 3);
+        assert_eq!(counter.telemetry_events["event_batch"], 2);
     }
 
     #[test]
@@ -722,8 +964,8 @@ mod tests {
     }
 
     #[test]
-    fn audit_v2_keeps_profile_across_windows_and_classifies_statuses() {
-        let dir = std::env::temp_dir().join(format!("audit-v2-{}", uuid::Uuid::new_v4()));
+    fn audit_v3_keeps_profile_and_closes_cancelled_request_across_windows() {
+        let dir = std::env::temp_dir().join(format!("audit-v3-{}", uuid::Uuid::new_v4()));
         let mut appender = Some(create_audit_appender(&dir).unwrap());
         let profile = AuditProfile {
             claude_version: "2.1.258".into(),
@@ -798,6 +1040,14 @@ mod tests {
             AuditMessage::Request(observation),
         );
         flush_summaries(&mut appender, &mut counters, &in_flight, 0);
+        apply_message(
+            &mut appender,
+            &mut counters,
+            &mut profiles,
+            &mut in_flight,
+            AuditMessage::CancelledBeforeResponse { account_id: 1 },
+        );
+        flush_summaries(&mut appender, &mut counters, &in_flight, 0);
         drop(appender);
         let text = std::fs::read_to_string(dir.join(AUDIT_FILE_NAME)).unwrap();
         assert_eq!(
@@ -809,6 +1059,14 @@ mod tests {
         assert!(text.contains("\"status_3xx\":1"));
         assert!(text.contains("\"status_4xx_other\":1"));
         assert!(text.contains("\"in_flight_at_end\":1"));
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["schema_version"], 3);
+        assert_eq!(last["requests"], 0);
+        assert_eq!(last["cancelled_before_response"], 1);
+        assert_eq!(last["in_flight_at_end"], 0);
+        assert_eq!(last["telemetry_send_failed"], 0);
+        assert_eq!(last["telemetry_pending_timed_out"], 0);
+        assert_eq!(last["telemetry_observation_dropped"], 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -816,7 +1074,11 @@ mod tests {
     async fn disabled_audit_does_not_create_file() {
         let dir = std::env::temp_dir().join(format!("audit-disabled-{}", uuid::Uuid::new_v4()));
         let audit = FingerprintAudit::start(false, dir.to_str().unwrap());
+        drop(audit.begin_request(test_observation(true)));
+        audit.begin_request(test_observation(false)).send_failed();
+        audit.begin_request(test_observation(true)).response(200);
         assert!(!audit.is_enabled());
+        assert_eq!(audit.dropped.load(Ordering::Relaxed), 0);
         assert!(!dir.join(AUDIT_FILE_NAME).exists());
     }
 }

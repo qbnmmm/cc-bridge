@@ -502,6 +502,17 @@ FINGERPRINT_AUDIT_ENABLED=true
 
 schema v2 会额外记录 count-token、3xx、普通 4xx、send failure、in-flight 以及 telemetry registered/completed/batched/pending-timeout 等计数。自动遥测的 success token、cache、cost、duration、TTFT、request ID 和 stop reason 来自真实上游响应解析，不再随机生成。
 
+schema v3 保留 v2 字段，并新增以下小时计数：
+
+- `cancelled_before_response`：请求在收到上游响应头前被取消；同时结束该请求的 in-flight 计数，不计为 HTTP 错误或发送失败。
+- `telemetry_send_failed`：自动遥测 HTTP 发送失败或收到非 2xx 的次数；一个失败批次只计一次，不按批次内的完成记录重复计数。
+- `telemetry_pending_timed_out`：等待请求完成观测超过 20 分钟后清理的记录数。
+- `telemetry_observation_dropped`：完成观测因内部队列满或关闭而未入队的记录数。
+
+`in_flight_at_end` 仅统计尚未记录响应头、发送失败或取消的推理请求，不代表正在输出的流或实际连接数；不依赖 `auto_telemetry` 或 usage 是否启用。`telemetry_failed` 保留旧版失败观测总数口径（包含超时、取消和失败批次内的记录），判断遥测 HTTP 失败请使用 `telemetry_send_failed`。本次只调整本地审计，遥测 pending 仍按原有 20 分钟超时清理。
+
+日志升级后可能同时包含 v1/v2/v3，分析时按 `schema_version` 区分；旧记录缺少的新字段不应视为零。进程重启后 in-flight 从零开始，旧日志里的历史计数保留。当 `dropped_audit_observations` 非零时，计数可能不完整。
+
 ---
 
 ## 架构概览

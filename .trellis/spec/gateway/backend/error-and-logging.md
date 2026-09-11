@@ -101,6 +101,7 @@ Correct：在 `main` 保存 guard，并在文件初始化失败时明确降级�
 - 环境变量：`FINGERPRINT_AUDIT_ENABLED`，默认 `false`。
 - active file：`<LOG_DIR>/fingerprint-audit.jsonl`。
 - schema：versioned NDJSON；事件类型为 `profile_snapshot`、`telemetry_session`、`hourly_summary`、`fingerprint_anomaly`。
+- schema v3：`FingerprintAudit::begin_request(...) -> AuditRequestGuard`；guard 消费方法为 `response(status)`、`send_failed()`，未结束时 Drop 记录 `cancelled_before_response`。
 
 ### 3. Contracts
 
@@ -109,11 +110,16 @@ Correct：在 `main` 保存 guard，并在文件初始化失败时明确降级�
 - 禁止字段：Authorization/Cookie/token/email、prompt/response/tool 内容、UUID 原值、relay/proxy URL、DSN 和代理凭证。
 - request path 使用 bounded `try_send`；文件 worker 独立写入，主请求不等待磁盘。
 - active file 10 MiB，active + 6 个历史文件；Unix 权限 `0600`。
+- 审计 guard 从推理请求登记开始，跨 token 解析和 send await 持有；收到响应头立即结束，不绑定流式 body。必须独立于 `auto_telemetry`、usage attempt 和 correlation ID，Count Tokens 不创建推理 guard。
+- 无审计丢弃时，跨窗口满足 `期末 in_flight = 期初 in_flight + requests - 各类 HTTP 响应数 - send_failed - cancelled_before_response`；取消不代表上游 HTTP 错误。
+- `telemetry_send_failed` 只统计 `event_batch` / `growthbook_eval` / `metrics` 的 HTTP 失败次数，失败 batch 内的 `batched` 不重复累计；`telemetry_pending_timed_out` 和 `telemetry_observation_dropped` 各自统计对应观测。
+- `telemetry_failed` 保留旧失败观测总数口径，包括 `cancelled` 和失败 batch 成员，不能作为 HTTP 失败率分子，也不等于三个新计数之和。旧 schema 缺失新字段不代表零。
 
 ### 4. Validation & Error Matrix
 
 - 功能关闭 -> 不创建专用文件。
 - queue full -> 丢弃 observation、递增 dropped counter，主请求继续。
+- begin observation 未入队 -> guard 不产生终止 observation，防止误减同账号其他请求；终止 observation 入队失败 -> 只增加 dropped counter，不阻塞或补发，计数允许不完整。
 - 目录/文件创建失败 -> `warn!`，audit 退化为空输出，网关继续。
 - 任意外部字符串不符合短 token allowlist -> 写 `other`，不得原样落盘。
 - serialization/flush 失败 -> `warn!`，不得转成 `AppError`。
@@ -123,6 +129,7 @@ Correct：在 `main` 保存 guard，并在文件初始化失败时明确降级�
 - Good：每小时每账号一条汇总，发现版本/UA/beta/request-ID 矛盾时立即写 anomaly。
 - Base：默认关闭；部署显式开启后从 `LOG_DIR` 获取文件。
 - Bad：逐请求保存完整 headers/body，或在 writer 队列满时阻塞流式响应。
+- Bad：仅在 `send().await` 的 Ok/Err 分支收尾，漏掉 future drop；或把 body 中途断开再次记作响应前取消。
 
 ### 6. Tests Required
 
@@ -130,9 +137,14 @@ Correct：在 `main` 保存 guard，并在文件初始化失败时明确降级�
 - 任意 model/entrypoint/feature 输入归一化为 `other`。
 - queue 满时 `try_send` 不阻塞并增加 dropped counter。
 - writer 输出单行合法 JSON、权限 `0600`；关闭时不创建文件。
+- abort 掉正在等待的请求 future 后 in-flight 归零；收到响应头后 abort 不增加响应前取消；关闭自动遥测仍记录三类终态。
+- 跨小时取消可产生 `requests=0, cancelled_before_response=1` 的窗口；守恒式使用上一窗口期末值。
+- 三种遥测发送端点的失败各计一次，成功不增加失败；多条失败 `batched` 不重复计 HTTP 失败；超时和观测丢弃分开累计。
 
 ### 7. Wrong vs Correct
 
 Wrong：复用普通 debug request logger 生成“诊断文件”，导致 token、prompt 或 UUID 泄漏。
 
 Correct：网关先提取 allowlisted enum/counter/presence，再提交给独立 audit worker。
+
+Wrong：用 `correlation_id.is_some()` 判断是否应记录审计发送失败。Correct：以持有的 `AuditRequestGuard` 记录终态，correlation ID 仅控制自动遥测清理。

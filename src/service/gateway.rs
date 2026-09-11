@@ -17,7 +17,7 @@ use crate::model::account::{Account, AccountStatus};
 use crate::model::api_token::ApiToken;
 use crate::service::account::AccountService;
 use crate::service::fingerprint_audit::{
-    FingerprintAudit, FingerprintMismatch, request_observation,
+    AuditRequestGuard, FingerprintAudit, FingerprintMismatch, request_observation,
 };
 use crate::service::rewriter::{
     ClientType, MessageEndpoint, Rewriter, classify_message_endpoint, clean_session_id_from_body,
@@ -298,7 +298,7 @@ impl GatewayService {
         cp!("rewrite");
 
         let message_endpoint = classify_message_endpoint(&path);
-        if message_endpoint == MessageEndpoint::Inference {
+        let mut audit_request = if message_endpoint == MessageEndpoint::Inference {
             let audit = build_fingerprint_observation(
                 &account,
                 client_type,
@@ -308,16 +308,19 @@ impl GatewayService {
                 &final_model,
                 is_stream,
             );
-            self.fingerprint_audit.observe_request(audit);
-        } else if message_endpoint == MessageEndpoint::CountTokens {
-            self.fingerprint_audit.observe_count_tokens(account.id);
-        }
+            Some(self.fingerprint_audit.begin_request(audit))
+        } else {
+            if message_endpoint == MessageEndpoint::CountTokens {
+                self.fingerprint_audit.observe_count_tokens(account.id);
+            }
+            None
+        };
 
         let upstream_token = match self.account_svc.resolve_upstream_token_with(&account).await {
             Ok(token) => token,
             Err(error) => {
-                if message_endpoint == MessageEndpoint::Inference {
-                    self.fingerprint_audit.observe_send_failed(account.id);
+                if let Some(audit) = audit_request.take() {
+                    audit.send_failed();
                 }
                 return Err(error);
             }
@@ -362,6 +365,7 @@ impl GatewayService {
                 &rid,
                 model_class,
                 usage_attempt,
+                audit_request,
             )
             .await?;
         cp!("forward_done");
@@ -409,6 +413,7 @@ impl GatewayService {
         rid: &str,
         model_class: crate::service::limit::ModelClass,
         mut usage_attempt: Option<UsageAttempt>,
+        mut audit_request: Option<AuditRequestGuard<'_>>,
     ) -> Result<Response, AppError> {
         let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
         if !query.is_empty() {
@@ -453,8 +458,8 @@ impl GatewayService {
             Ok(resp) => resp,
             Err(error) => {
                 warn!("upstream error for account {}: {}", account.id, error);
-                if correlation_id.is_some() {
-                    self.fingerprint_audit.observe_send_failed(account.id);
+                if let Some(audit) = audit_request.take() {
+                    audit.send_failed();
                 }
                 if let Some(correlation_id) = correlation_id {
                     self.telemetry_svc
@@ -471,9 +476,8 @@ impl GatewayService {
         );
 
         let status_code = resp.status().as_u16();
-        if usage_attempt.is_some() {
-            self.fingerprint_audit
-                .observe_response(account.id, status_code);
+        if let Some(audit) = audit_request.take() {
+            audit.response(status_code);
         }
         if let Some(attempt) = usage_attempt.as_mut() {
             attempt.is_stream = usage_response_is_stream(resp.headers(), attempt.is_stream);

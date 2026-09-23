@@ -471,16 +471,18 @@ curl -X POST http://127.0.0.1:5674/admin/tokens \
 
 ## 自动遥测
 
-开启 `auto_telemetry` 后，网关代替客户端发送遥测：
+开启 `auto_telemetry` 后，网关拦截经过本站的客户端遥测，并基于真实请求完成观测代发：
 
 | 功能 | 说明 |
 |------|------|
 | **拦截** | 客户端遥测请求返回 200，不转发上游 |
-| **代发** | `/api/event_logging/batch`（每 10s）、`/api/eval/sdk-*`（每 6h） |
+| **代发** | `/api/event_logging/v2/batch`（每 10s 检查待发送批次）、`/api/eval/sdk-*`（每 6h） |
 | **触发** | 账号收到 `/v1/messages` 请求时激活遥测会话（10min TTL，自动续期） |
-| **拦截路径** | `/api/event_logging/batch`、`/api/eval/*`、`/api/claude_code/metrics`、`/api/claude_code/organizations/metrics_enabled` |
+| **拦截路径** | `/api/event_logging/batch`、`/api/event_logging/v2/batch`、`/api/eval/*`、`/api/claude_code/metrics`、`/api/claude_code/organizations/metrics_enabled` |
 
-> Datadog 遥测由客户端直连 `browser-intake-datadoghq.com`，无法通过网关拦截。建议在网络层屏蔽。
+事件通用字段保存在 `event_data`，token、缓存写入、耗时等事件元数据编码到 base64 JSON `additional_metadata`。只生成真实完成观测对应的 query/success 对，不生成客户端启动或工具事件；无法从请求确定的 `querySource`、客户端重试次数等字段省略。metrics 尚未接入真实观测，空数组继续跳过发送。
+
+> 官方客户端使用中转站时仍可能直连 `api.anthropic.com/api/event_logging/v2/batch`，Datadog 也使用独立域名；这些直连请求不经过网关，`auto_telemetry` 和网关审计均无法覆盖。需要关闭客户端遥测时，在本地设置 `DISABLE_TELEMETRY=1` 后重启客户端。不要在中转站服务器屏蔽 `api.anthropic.com`，服务器转发模型请求需要该域名。
 
 ### 脱敏环境指纹审计
 
@@ -736,7 +738,7 @@ USAGE_PRICING_OVERRIDES_JSON={"custom-model":{"input_usd_per_million":"3","outpu
 | 路径 | 改写内容 |
 |------|---------|
 | `/v1/messages` | 系统提示词注入、`metadata.user_id`、环境/进程指纹、`cache_control`、billing 处理 |
-| `/api/event_logging/batch` | `device_id`、`email`、`account_uuid`、`organization_uuid`、env/process 指纹、`user_attributes` JSON |
+| `/api/event_logging/batch`、`/api/event_logging/v2/batch` | 兼容 flat 与 `event_data` envelope；改写设备、邮箱、账号/组织及嵌套 auth、env/process、`user_attributes`，保留其他事件字段 |
 | `/api/eval/{clientKey}` | `id`、`deviceID`、`email`、`accountUUID`、`organizationUUID`、`subscriptionType`、移除 `apiBaseUrlHost` |
 | 其他路径 | 通用身份字段改写 |
 

@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::model::account::{Account, CanonicalEnvData, CanonicalProcessData};
 use crate::service::fingerprint_audit::FingerprintAudit;
-use crate::service::rewriter::ClientType;
+use crate::service::rewriter::{ClientType, is_event_batch_path};
 use crate::service::usage::CompletedInferenceObservation;
 use crate::store::account_store::AccountStore;
 
@@ -28,6 +28,7 @@ const PENDING_HARD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const EVENT_BATCH_MAX_COMPLETIONS: usize = 64;
 
 const UPSTREAM_BASE: &str = "https://api.anthropic.com";
+const EVENT_BATCH_PATH: &str = "/api/event_logging/v2/batch";
 const GROWTHBOOK_CLIENT_KEY: &str = "sdk-zAZezfDKGoZuXXKe";
 
 // ---------------------------------------------------------------------------
@@ -36,7 +37,7 @@ const GROWTHBOOK_CLIENT_KEY: &str = "sdk-zAZezfDKGoZuXXKe";
 
 /// 判断请求路径是否为遥测端点。
 pub fn is_telemetry_path(path: &str) -> bool {
-    path.contains("/event_logging/batch")
+    is_event_batch_path(path)
         || path.starts_with("/api/eval/")
         || path.starts_with("/api/claude_code/metrics")
         || path.starts_with("/api/claude_code/organizations/metrics_enabled")
@@ -92,10 +93,8 @@ struct TelemetrySession {
     mem_heap_used: i64,
     mem_external: i64,
     mem_array_buffers: i64,
-    /// 已累计发送的事件条数（所有 event_logging/batch 内条数之和），用于日志。
+    /// 已累计发送的事件条数，用于日志。
     events_sent_total: i64,
-    /// 是否已发送过 tengu_startup（整个遥测会话中只发一次）。
-    startup_sent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -120,7 +119,8 @@ pub struct TelemetryRequestProfile {
     pub model: String,
     pub betas: String,
     pub entrypoint: String,
-    pub client_type: String,
+    pub client_type: Option<&'static str>,
+    pub client_request_id: Option<String>,
     pub is_interactive: bool,
     pub thinking_type: Option<String>,
     pub effort: Option<String>,
@@ -165,8 +165,15 @@ impl TelemetryRequestProfile {
             model: model.to_string(),
             betas: header("anthropic-beta").unwrap_or("").to_string(),
             is_interactive: entrypoint == "cli",
+            client_type: match entrypoint.as_str() {
+                "cli" => Some("cli"),
+                "sdk-cli" => Some("sdk-cli"),
+                _ => None,
+            },
+            client_request_id: header("x-client-request-id")
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
             entrypoint,
-            client_type: "cli".into(),
             thinking_type,
             effort,
             fast_mode: header("anthropic-beta").is_some_and(|value| {
@@ -329,7 +336,6 @@ impl TelemetryService {
             mem_external: mem_ext,
             mem_array_buffers: mem_ab,
             events_sent_total: 0,
-            startup_sent: false,
         };
         sessions.insert(account.id, session);
 
@@ -450,7 +456,7 @@ async fn telemetry_loop(
 
         let now = Instant::now();
 
-        // --- event_logging/batch ---
+        // --- event_logging/v2/batch ---
         // 仅当有待发送事件 + 已过最小间隔 + 超过抖动的允许发送时间
         if !session.ready.is_empty()
             && now.duration_since(session.last_event_batch_at) >= EVENT_BATCH_INTERVAL
@@ -510,9 +516,6 @@ async fn telemetry_loop(
                 proc_preset.array_buffers_range,
             );
 
-            let emit_startup = !session.startup_sent;
-            session.startup_sent = true;
-
             let completions: Vec<_> = (0..EVENT_BATCH_MAX_COMPLETIONS)
                 .filter_map(|_| session.ready.pop_front())
                 .collect();
@@ -530,7 +533,6 @@ async fn telemetry_loop(
                 mem_heap_used: session.mem_heap_used,
                 mem_external: session.mem_external,
                 mem_array_buffers: session.mem_array_buffers,
-                emit_startup,
             });
             let event_count = payload
                 .get("events")
@@ -548,7 +550,7 @@ async fn telemetry_loop(
 
             let success = send_telemetry(
                 &c,
-                &format!("{}/api/event_logging/batch", UPSTREAM_BASE),
+                &format!("{UPSTREAM_BASE}{EVENT_BATCH_PATH}"),
                 &token,
                 &payload,
                 &session_ua(&store, account_id).await,
@@ -592,11 +594,7 @@ async fn telemetry_loop(
         }
 
         // --- metrics (/api/claude_code/metrics) ---
-        // 真实 CC (bigqueryExporter.ts) 对 OAuth 用户也会发，只要 token 有 user:profile scope。
-        // 修复前的 "OAuth 不支持" 注释是错的 — 完全静默会被识别为代理。
-        // 但当前 build_metrics 还没实现真实 metric，固定发 metrics=[] 会被 Anthropic 400
-        // ("At least one metric must be provided")，反复 400 会让 device_id 被标记 →
-        // 后续 /v1/messages 被连带 429。空数组时直接跳过本轮发送。
+        // 尚未接入真实 metric；空数组不满足上游至少一条 metric 的要求，跳过发送。
         if now.duration_since(session.last_metrics_at) >= METRICS_INTERVAL {
             let payload = build_metrics(&session.account);
             let has_metrics = payload
@@ -780,15 +778,9 @@ struct EventBatchCtx<'a> {
     mem_heap_used: i64,
     mem_external: i64,
     mem_array_buffers: i64,
-    /// 本次是否需要补发 tengu_startup（每个 telemetry session 只发一次）。
-    emit_startup: bool,
 }
 
-/// 构造 /api/event_logging/batch 请求体。
-///
-/// 真实 CC 的 `/batch` 端点每次 POST 承载多条事件。
-/// 这里仅构造与实际消息请求对应的最少可信集合：首个 batch 带 `tengu_startup`，
-/// 每个 batch 带 `tengu_api_query` + `tengu_api_success`；没有真实工具观察时不伪造工具事件。
+/// 构造 v2 query/success 批次；事件元数据按官方结构编码到 additional_metadata。
 fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
     let env = parse_env(ctx.account);
     let proc = parse_process(ctx.account);
@@ -814,60 +806,55 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
     }
     let build_age_mins = compute_build_age_minutes(&env.build_time);
 
-    let make_base = |name: &str,
-                     timestamp: chrono::DateTime<Utc>,
-                     profile: &TelemetryRequestProfile|
+    let make_event = |name: &str,
+                      timestamp: chrono::DateTime<Utc>,
+                      profile: &TelemetryRequestProfile,
+                      model: &str,
+                      metadata: serde_json::Value|
      -> serde_json::Value {
         let mut event = json!({
             "event_id": uuid::Uuid::new_v4().to_string(),
             "event_name": name,
             "client_timestamp": timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "device_id": ctx.account.device_id,
-            "email": ctx.account.email,
             "session_id": ctx.session_id,
+            "model": model,
             "user_type": "external",
-            "is_interactive": profile.is_interactive,
-            "client_type": profile.client_type,
             "entrypoint": profile.entrypoint,
             "auth": auth.clone(),
             "env": env_obj.clone(),
             "process": process_b64,
+            "additional_metadata": base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&metadata).unwrap_or_default()),
         });
-        if let (Some(map), Some(age)) = (event.as_object_mut(), build_age_mins) {
-            map.insert("buildAgeMins".into(), json!(age));
+        if !ctx.account.email.is_empty() {
+            event["email"] = json!(ctx.account.email);
         }
-        event
+        if let Some(client_type) = profile.client_type {
+            event["client_type"] = json!(client_type);
+            event["is_interactive"] = json!(profile.is_interactive);
+        }
+        if !profile.betas.is_empty() {
+            event["betas"] = json!(profile.betas);
+        }
+        json!({"event_type":"ClaudeCodeInternalEvent","event_data":event})
     };
-    let wrap = |event_data| json!({"event_type":"ClaudeCodeInternalEvent","event_data":event_data});
-    let mut events = Vec::new();
-    if ctx.emit_startup {
-        if let Some(first) = ctx.completions.first() {
-            let mut event = make_base(
-                "tengu_startup",
-                first.pending.request_timestamp,
-                &first.pending.profile,
-            );
-            event["model"] = json!(first.pending.profile.model);
-            event["provider"] = json!("firstParty");
-            event["isFirstSession"] = json!(true);
-            event["querySource"] = json!("user");
-            events.push(wrap(event));
+    let make_metadata = |profile: &TelemetryRequestProfile, model: &str| {
+        let mut metadata = json!({"model": model, "provider": "firstParty"});
+        if let Some(age) = build_age_mins {
+            metadata["buildAgeMins"] = json!(age);
         }
-    }
+        if !profile.betas.is_empty() {
+            metadata["betas"] = json!(profile.betas);
+        }
+        metadata
+    };
+    let mut events = Vec::new();
     for completed in &ctx.completions {
         let profile = &completed.pending.profile;
         let observation = &completed.observation;
-        let mut query = make_base(
-            "tengu_api_query",
-            completed.pending.request_timestamp,
-            profile,
-        );
-        query["model"] = json!(profile.model);
+        let mut query = make_metadata(profile, &profile.model);
         query["messagesLength"] = json!(profile.message_count);
-        query["provider"] = json!("firstParty");
-        query["betas"] = json!(profile.betas);
-        query["permissionMode"] = json!("default");
-        query["querySource"] = json!("user");
         query["fastMode"] = json!(profile.fast_mode);
         if let Some(ref value) = profile.thinking_type {
             query["thinkingType"] = json!(value);
@@ -875,11 +862,15 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
         if let Some(ref value) = profile.effort {
             query["effortValue"] = json!(value);
         }
-        events.push(wrap(query));
+        events.push(make_event(
+            "tengu_api_query",
+            completed.pending.request_timestamp,
+            profile,
+            &profile.model,
+            query,
+        ));
 
-        let mut success = make_base("tengu_api_success", observation.completed_at_utc, profile);
-        success["model"] = json!(observation.model);
-        success["betas"] = json!(profile.betas);
+        let mut success = make_metadata(profile, &observation.model);
         success["messageCount"] = json!(profile.message_count);
         if let Some(tokens) = &observation.tokens {
             success["inputTokens"] = json!(tokens.input);
@@ -887,19 +878,19 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
             success["cachedInputTokens"] = json!(tokens.cache_read);
             success["uncachedInputTokens"] = json!(
                 tokens
-                    .input
-                    .saturating_add(tokens.cache_creation_5m)
+                    .cache_creation_5m
                     .saturating_add(tokens.cache_creation_1h)
             );
         }
         success["durationMs"] = json!(observation.duration_ms);
-        success["durationMsIncludingRetries"] = json!(observation.duration_ms);
-        success["attempt"] = json!(1);
         if let Some(ttft) = observation.ttft_ms {
             success["ttftMs"] = json!(ttft);
         }
         if let Some(ref request_id) = observation.upstream_request_id {
             success["requestId"] = json!(request_id);
+        }
+        if let Some(ref request_id) = profile.client_request_id {
+            success["clientRequestId"] = json!(request_id);
         }
         if let Some(ref reason) = observation.stop_reason {
             success["stop_reason"] = json!(reason);
@@ -907,16 +898,20 @@ fn build_event_batch(ctx: EventBatchCtx<'_>) -> serde_json::Value {
         if let Some(cost) = observation.cost_nano_usd {
             success["costUSD"] = json!(cost as f64 / 1_000_000_000.0);
         }
-        success["isNonInteractiveSession"] = json!(!profile.is_interactive);
-        success["print"] = json!(profile.entrypoint == "sdk-cli");
-        success["isTTY"] = json!(profile.is_interactive);
-        success["querySource"] = json!("user");
-        success["provider"] = json!("firstParty");
-        success["clientDropped"] = json!(observation.client_dropped);
+        if profile.client_type.is_some() {
+            success["isNonInteractiveSession"] = json!(!profile.is_interactive);
+            success["print"] = json!(profile.entrypoint == "sdk-cli");
+        }
         if let Some(ref effort) = profile.effort {
             success["effort_level"] = json!(effort);
         }
-        events.push(wrap(success));
+        events.push(make_event(
+            "tengu_api_success",
+            observation.completed_at_utc,
+            profile,
+            &observation.model,
+            success,
+        ));
     }
     json!({"events": events})
 }
@@ -1067,7 +1062,6 @@ mod tests {
         session_id: &'a str,
         cpu_user: i64,
         cpu_system: i64,
-        emit_startup: bool,
     ) -> EventBatchCtx<'a> {
         let body = serde_json::json!({});
         EventBatchCtx {
@@ -1080,7 +1074,8 @@ mod tests {
                         betas: crate::service::rewriter::compute_betas_for_request(model, &body)
                             .join(","),
                         entrypoint: "cli".into(),
-                        client_type: "cli".into(),
+                        client_type: Some("cli"),
+                        client_request_id: Some("client_request_123".into()),
                         is_interactive: true,
                         thinking_type: None,
                         effort: None,
@@ -1121,7 +1116,6 @@ mod tests {
             mem_heap_used: 60_000_000,
             mem_external: 2_000_000,
             mem_array_buffers: 30_000,
-            emit_startup,
         }
     }
 
@@ -1151,6 +1145,13 @@ mod tests {
             .and_then(|e| e["event_data"].as_object())
     }
 
+    fn metadata(data: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data["additional_metadata"].as_str().unwrap())
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
     #[test]
     fn request_profile_preserves_sdk_entrypoint_thinking_and_effort() {
         let headers = HashMap::from([
@@ -1161,6 +1162,10 @@ mod tests {
             (
                 "anthropic-beta".into(),
                 "thinking-token-count-2026-05-13,effort-2025-11-24".into(),
+            ),
+            (
+                "x-client-request-id".into(),
+                "client-request-observed".into(),
             ),
         ]);
         let body = json!({
@@ -1174,6 +1179,11 @@ mod tests {
             ClientType::ClaudeCode,
         );
         assert_eq!(profile.entrypoint, "sdk-cli");
+        assert_eq!(profile.client_type, Some("sdk-cli"));
+        assert_eq!(
+            profile.client_request_id.as_deref(),
+            Some("client-request-observed")
+        );
         assert!(!profile.is_interactive);
         assert_eq!(profile.thinking_type.as_deref(), Some("adaptive"));
         assert_eq!(profile.effort.as_deref(), Some("low"));
@@ -1182,7 +1192,7 @@ mod tests {
     #[test]
     fn event_batch_does_not_fabricate_tool_use_event() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-5", "sid", 0, 0, false));
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-5", "sid", 0, 0));
         assert!(find_event(&batch, "tengu_tool_use_success").is_none());
     }
 
@@ -1191,7 +1201,7 @@ mod tests {
     #[test]
     fn event_batch_uses_tracked_model_id() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-opus-4-6", "sid", 0, 0, false));
+        let batch = build_event_batch(ctx_for(&account, "claude-opus-4-6", "sid", 0, 0));
         let data = event_data(&batch);
         assert_eq!(
             data["model"].as_str(),
@@ -1203,7 +1213,7 @@ mod tests {
     #[test]
     fn event_batch_betas_match_rewriter_for_given_model() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0));
         let betas = event_data(&batch)["betas"].as_str().unwrap().to_string();
         let expected =
             crate::service::rewriter::compute_betas_for_model("claude-sonnet-4-5").join(",");
@@ -1217,14 +1227,7 @@ mod tests {
     #[test]
     fn event_batch_legacy_haiku_betas_omit_isp_and_context() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(
-            &account,
-            "claude-3-5-haiku-20241022",
-            "sid",
-            0,
-            0,
-            false,
-        ));
+        let batch = build_event_batch(ctx_for(&account, "claude-3-5-haiku-20241022", "sid", 0, 0));
         let betas = event_data(&batch)["betas"].as_str().unwrap();
         assert!(
             !betas.contains("context-management-2025-06-27"),
@@ -1251,7 +1254,7 @@ mod tests {
     #[test]
     fn event_batch_haiku_4_5_keeps_isp_context_and_claude_code() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-haiku-4-5", "sid", 0, 0, false));
+        let batch = build_event_batch(ctx_for(&account, "claude-haiku-4-5", "sid", 0, 0));
         let betas = event_data(&batch)["betas"].as_str().unwrap();
         assert!(
             betas.contains("claude-code-20250219"),
@@ -1375,16 +1378,9 @@ mod tests {
     // ---- Task #5: Telemetry schema completeness (tengu_api_success) ----
 
     #[test]
-    fn event_batch_contains_all_tengu_api_success_fields() {
+    fn event_batch_uses_v2_envelope_and_real_completion_metadata() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(
-            &account,
-            "claude-sonnet-4-5",
-            "sid",
-            1_000,
-            500,
-            false,
-        ));
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 1_000, 500));
         let data = event_data(&batch);
 
         let required = [
@@ -1395,26 +1391,10 @@ mod tests {
             "session_id",
             "model",
             "betas",
-            "messageCount",
-            "inputTokens",
-            "outputTokens",
-            "cachedInputTokens",
-            "uncachedInputTokens",
-            "durationMs",
-            "durationMsIncludingRetries",
-            "attempt",
-            "ttftMs",
-            "requestId",
-            "stop_reason",
-            "costUSD",
-            "isNonInteractiveSession",
-            "print",
-            "isTTY",
-            "querySource",
-            "provider",
             "auth",
             "env",
             "process",
+            "additional_metadata",
         ];
         for f in required {
             assert!(
@@ -1424,19 +1404,178 @@ mod tests {
             );
         }
         assert_eq!(data["event_name"].as_str(), Some("tengu_api_success"));
-        assert_eq!(data["provider"].as_str(), Some("firstParty"));
-        assert_eq!(data["attempt"].as_i64(), Some(1));
-        assert_eq!(data["inputTokens"], 100);
-        assert_eq!(data["outputTokens"], 20);
-        assert_eq!(data["durationMs"], 900);
-        assert_eq!(data["ttftMs"], 200);
-        assert_eq!(data["stop_reason"], "end_turn");
+        let meta = metadata(data);
+        assert_eq!(meta["provider"], "firstParty");
+        assert_eq!(meta["inputTokens"], 100);
+        assert_eq!(meta["outputTokens"], 20);
+        assert_eq!(meta["cachedInputTokens"], 5);
+        assert_eq!(meta["uncachedInputTokens"], 7);
+        assert_eq!(meta["durationMs"], 900);
+        assert_eq!(meta["ttftMs"], 200);
+        assert_eq!(meta["stop_reason"], "end_turn");
+        assert_eq!(meta["costUSD"], 0.123);
+        assert_eq!(meta["clientRequestId"], "client_request_123");
+        for key in [
+            "inputTokens",
+            "durationMs",
+            "requestId",
+            "provider",
+            "buildAgeMins",
+        ] {
+            assert!(
+                !data.contains_key(key),
+                "event metadata leaked to envelope: {key}"
+            );
+        }
+        for key in [
+            "querySource",
+            "permissionMode",
+            "isTTY",
+            "attempt",
+            "firstContentMs",
+            "snapshotHash",
+        ] {
+            assert!(
+                meta.get(key).is_none(),
+                "unobserved metadata was generated: {key}"
+            );
+        }
+
+        let query = find_event(&batch, "tengu_api_query").unwrap();
+        assert!(!query.contains_key("messagesLength"));
+        assert_eq!(metadata(query)["messagesLength"], 1);
+        assert!(metadata(query).get("querySource").is_none());
+    }
+
+    #[test]
+    fn sdk_payload_keeps_observed_fields_and_omits_unknown_context() {
+        let mut account = make_account();
+        account.email.clear();
+        let headers = HashMap::from([
+            (
+                "User-Agent".into(),
+                "claude-cli/2.1.280 (external, sdk-cli)".into(),
+            ),
+            ("x-client-request-id".into(), "client-observed".into()),
+        ]);
+        let profile = TelemetryRequestProfile::from_request(
+            "claude-sonnet-5",
+            &headers,
+            &json!({"thinking":{"type":"adaptive"},"output_config":{"effort":"high"},"messages":[{}]}),
+            ClientType::ClaudeCode,
+        );
+        let mut ctx = ctx_for(&account, "claude-sonnet-5", "sid", 0, 0);
+        ctx.completions[0].pending.profile = profile;
+        let tokens = ctx.completions[0].observation.tokens.as_mut().unwrap();
+        tokens.cache_creation_5m = 0;
+        tokens.cache_creation_1h = 0;
+        let batch = build_event_batch(ctx);
+        let success = event_data(&batch);
+        assert_eq!(success["client_type"], "sdk-cli");
+        assert_eq!(success["is_interactive"], false);
+        assert!(!success.contains_key("email"));
+        let meta = metadata(success);
+        assert_eq!(meta["inputTokens"], 100);
+        assert_eq!(meta["uncachedInputTokens"], 0);
+        assert_eq!(meta["clientRequestId"], "client-observed");
+        assert_eq!(meta["print"], true);
+        assert_eq!(meta["effort_level"], "high");
+        let query_meta = metadata(find_event(&batch, "tengu_api_query").unwrap());
+        assert_eq!(query_meta["thinkingType"], "adaptive");
+        assert_eq!(query_meta["effortValue"], "high");
+        assert!(query_meta.get("querySource").is_none());
+
+        let mut ctx = ctx_for(&account, "claude-sonnet-5", "sid", 0, 0);
+        ctx.completions[0].pending.profile = TelemetryRequestProfile::from_request(
+            "claude-sonnet-5",
+            &HashMap::from([(
+                "User-Agent".into(),
+                "claude-cli/2.1.280 (external, unknown-host)".into(),
+            )]),
+            &json!({}),
+            ClientType::ClaudeCode,
+        );
+        let batch = build_event_batch(ctx);
+        let success = event_data(&batch);
+        assert!(!success.contains_key("client_type"));
+        assert!(!success.contains_key("is_interactive"));
+        let meta = metadata(success);
+        for key in [
+            "clientRequestId",
+            "print",
+            "isNonInteractiveSession",
+            "querySource",
+            "effort_level",
+        ] {
+            assert!(
+                meta.get(key).is_none(),
+                "unknown field {key} should be absent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn event_batch_http_request_uses_v2_path_and_encoded_metadata() {
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+
+        let received = Arc::new(Mutex::new(None));
+        let capture = received.clone();
+        let app = Router::new().route(
+            "/api/event_logging/v2/batch",
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let capture = capture.clone();
+                    async move {
+                        *capture.lock().await = Some((headers, body));
+                        StatusCode::NO_CONTENT
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let account = make_account();
+        let payload = build_event_batch(ctx_for(&account, "claude-opus-5-5", "sid", 0, 0));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let success = send_telemetry(
+            &client,
+            &format!("http://{address}{EVENT_BATCH_PATH}"),
+            "test-token",
+            &payload,
+            "claude-code/2.1.280",
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+
+        assert!(success);
+        let (headers, body) = received.lock().await.take().unwrap();
+        assert_eq!(headers["authorization"], "Bearer test-token");
+        assert_eq!(headers["user-agent"], "claude-code/2.1.280");
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
+        assert_eq!(body["events"][0]["event_type"], "ClaudeCodeInternalEvent");
+        let data = event_data(&body);
+        assert_eq!(data["model"], "claude-opus-5-5");
+        assert!(!data.contains_key("inputTokens"));
+        let meta = metadata(data);
+        assert_eq!(meta["inputTokens"], 100);
+        assert_eq!(meta["uncachedInputTokens"], 7);
     }
 
     #[test]
     fn event_batch_auth_carries_account_and_org_uuid() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0));
         let auth = &event_data(&batch)["auth"];
         assert_eq!(
             auth["account_uuid"].as_str(),
@@ -1451,8 +1590,9 @@ mod tests {
     #[test]
     fn event_batch_request_id_is_prefixed() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
-        let rid = event_data(&batch)["requestId"].as_str().unwrap();
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0));
+        let meta = metadata(event_data(&batch));
+        let rid = meta["requestId"].as_str().unwrap();
         assert!(rid.starts_with("req_"), "requestId must have `req_` prefix");
         assert!(rid.len() >= 20, "requestId too short: {}", rid);
     }
@@ -1468,7 +1608,6 @@ mod tests {
             "fixed-sid-123",
             0,
             0,
-            false,
         ));
         let data = event_data(&batch);
         assert_eq!(
@@ -1481,19 +1620,9 @@ mod tests {
     #[test]
     fn event_batch_session_id_is_same_across_all_events_in_batch() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(
-            &account,
-            "claude-sonnet-4-5",
-            "sid-same",
-            0,
-            0,
-            true,
-        ));
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid-same", 0, 0));
         let events = batch["events"].as_array().unwrap();
-        assert!(
-            events.len() >= 2,
-            "batch should have multiple events when emit_startup=true"
-        );
+        assert_eq!(events.len(), 2);
         for ev in events {
             assert_eq!(
                 ev["event_data"]["session_id"].as_str(),
@@ -1508,7 +1637,7 @@ mod tests {
     #[test]
     fn event_batch_contains_query_and_success_pair() {
         let account = make_account();
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0));
         assert!(
             find_event(&batch, "tengu_api_query").is_some(),
             "batch must include tengu_api_query (real CC always logs both before and after a call)"
@@ -1520,21 +1649,12 @@ mod tests {
     }
 
     #[test]
-    fn event_batch_emit_startup_adds_tengu_startup_once() {
+    fn event_batch_does_not_invent_a_client_startup() {
         let account = make_account();
-        let batch_first =
-            build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, true));
-        assert!(
-            find_event(&batch_first, "tengu_startup").is_some(),
-            "first batch (emit_startup=true) must include tengu_startup"
-        );
-
-        let batch_second =
-            build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0, false));
-        assert!(
-            find_event(&batch_second, "tengu_startup").is_none(),
-            "subsequent batches (emit_startup=false) must NOT include tengu_startup"
-        );
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid", 0, 0));
+        assert!(find_event(&batch, "tengu_startup").is_none());
+        assert!(find_event(&batch, "tengu_started").is_none());
+        assert!(find_event(&batch, "tengu_startup_telemetry").is_none());
     }
 
     #[test]
@@ -1544,7 +1664,7 @@ mod tests {
         account.canonical_env["version"] = json!("2.1.258");
         account.canonical_env["version_base"] = json!("2.1.258");
         account.canonical_env["build_time"] = json!("2026-09-01T21:54:40Z");
-        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid-x", 0, 0, true));
+        let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid-x", 0, 0));
         let events = batch["events"].as_array().unwrap();
         let first_device = events[0]["event_data"]["device_id"].as_str().unwrap();
         let first_email = events[0]["event_data"]["email"].as_str().unwrap();
@@ -1591,6 +1711,8 @@ mod tests {
     #[test]
     fn is_telemetry_path_matches_known_endpoints() {
         assert!(is_telemetry_path("/api/event_logging/batch"));
+        assert!(is_telemetry_path("/api/event_logging/v2/batch"));
+        assert!(is_telemetry_path(EVENT_BATCH_PATH));
         assert!(is_telemetry_path("/api/eval/sdk-zAZezfDKGoZuXXKe"));
         assert!(is_telemetry_path("/api/claude_code/metrics"));
         assert!(is_telemetry_path(
@@ -1598,6 +1720,7 @@ mod tests {
         ));
         assert!(!is_telemetry_path("/v1/messages"));
         assert!(!is_telemetry_path("/api/oauth/usage"));
+        assert!(!is_telemetry_path("/api/event_logging/v2/batch/other"));
     }
 
     // ---- R5: metrics payload 结构（对齐 bigqueryExporter.ts）----
@@ -1625,7 +1748,7 @@ mod tests {
     #[test]
     fn event_batch_contains_multiple_real_completion_pairs() {
         let account = make_account();
-        let mut ctx = ctx_for(&account, "claude-opus-5", "sid", 0, 0, false);
+        let mut ctx = ctx_for(&account, "claude-opus-5", "sid", 0, 0);
         let mut second = ctx.completions[0].clone();
         second.observation.model = "claude-sonnet-5".into();
         second.observation.tokens.as_mut().unwrap().input = 777;
@@ -1645,11 +1768,9 @@ mod tests {
             .filter(|event| event["event_data"]["event_name"] == "tengu_api_success")
             .collect();
         assert_eq!(successes.len(), 2);
-        assert_eq!(successes[1]["event_data"]["inputTokens"], 777);
-        assert_eq!(
-            successes[1]["event_data"]["requestId"],
-            "req_second_12345678901234567890"
-        );
+        let second_meta = metadata(successes[1]["event_data"].as_object().unwrap());
+        assert_eq!(second_meta["inputTokens"], 777);
+        assert_eq!(second_meta["requestId"], "req_second_12345678901234567890");
     }
 
     #[test]
@@ -1673,7 +1794,7 @@ mod tests {
     fn pending_hard_timeout_removes_only_stale_requests() {
         let account = make_account();
         let now = Instant::now();
-        let mut stale = ctx_for(&account, "claude-opus-5", "sid", 0, 0, false)
+        let mut stale = ctx_for(&account, "claude-opus-5", "sid", 0, 0)
             .completions
             .remove(0)
             .pending;

@@ -53,13 +53,13 @@
 `Rewriter` 按路径分派：
 
 - `/v1/messages`：模型 `[1m]`、Claude Code metadata/system prompt、API 注入模式、billing/CCH、空 text/cache_control 等。
-- `/api/event_logging/batch`：设备、账号、环境、process 和 user attributes。
+- `/api/event_logging/batch` 与 `/api/event_logging/v2/batch`：共用 `is_event_batch_path`，兼容 flat `events[]` 与 wrapped `events[].event_data`，改写设备、账号、嵌套 auth、环境、process 和 user attributes。
 - `/api/eval/*`：GrowthBook identity 字段并移除 gateway host。
 - 其它 JSON：仅在字段存在时改写通用 identity。
 
 非 JSON body 原样返回。API 模式会删除内部 `_session_id` 后才发上游。beta header 由 `compute_betas_for_model` 集中计算，修改模型规则必须更新其单测。
 
-自动遥测路径被本地拦截并返回假成功，真实代发由后台会话执行。`send_telemetry` 的失败只 `warn!`，不能让主请求失败；Datadog 客户端直连不在本项目拦截范围，见 `README.md`。
+经过网关的自动遥测路径被本地拦截并返回成功，真实代发由后台会话执行。`send_telemetry` 的失败只 `warn!`，不能让主请求失败。官方事件 v2 和 Datadog 都可能由客户端直连，直连请求不在网关拦截/审计范围，见 `README.md`。
 
 ## Scenario: 动态模型级周额度
 
@@ -157,3 +157,49 @@ Correct：只使用 OAuth usage/实时 rate-limit 数据，并按实际存在的
 Wrong: independently hard-code a version or Stainless value in `oauth.rs`, `rewriter.rs` or `telemetry.rs`.
 
 Correct: use the identity-owned release constants and endpoint-specific formatting/selection logic.
+
+## Scenario: Claude Code v2 event batch
+
+### 1. Scope / Trigger
+
+- 转发客户端事件批次，或自动遥测根据真实完成观测生成 query/success。依据为 2.1.258/2.1.280 官方客户端本地拦截样本；真实 OAuth 上游接受结果需部署后单独观察。
+
+### 2. Signatures
+
+- `rewriter::is_event_batch_path(path)`：精确识别 `/api/event_logging/batch`、`/api/event_logging/v2/batch`，供重写和拦截复用。
+- 自动代发 `POST /api/event_logging/v2/batch`，`events[] = {event_type, event_data}`。
+- `event_data.additional_metadata`：标准 base64 编码的 JSON 对象。
+
+### 3. Contracts
+
+- event_data 保存 model/betas、设备/会话、auth/env/process 及已知入口；token、cache、duration、TTFT、上下游 request ID、thinking/effort、buildAge 属于 additional_metadata。没有客户端事实的字段省略。
+- `uncachedInputTokens` 是 cache creation（5m + 1h）；普通未缓存输入独立存 inputTokens，不加到该字段中。
+- cli/sdk-cli 映射 client_type，未知入口缺省；同一 UA 可包含主查询和标题请求，不据此推断 querySource。没有客户端进程/工具观测时不合成启动/工具事件。
+- 转发同时兼容 flat 与 wrapped payload，在正确层级改写 `auth.account_uuid` / `auth.organization_uuid`；无目标 organization 时移除旧值。
+- 保留未知事件/metadata 字段，process 和 additional_metadata 非法编码保持原值；剥除 gateway/baseUrl 继续使用既有规则。
+- 仍以完成观测驱动批次，保持 pending、ready、计数及发送失败语义；metrics 空数组继续跳过。
+
+### 4. Validation & Error Matrix
+
+- v1/v2 到达网关且 auto_telemetry=true -> 相同拦截路径；关闭自动遥测 -> 同一重写逻辑再转发。
+- events 非数组、event_data 非对象 -> 不 panic，保留非目标数据。
+- 缺失 clientRequestId/effort/客户端上下文 -> 不用生成值补齐。
+- 遥测 HTTP 非 2xx/传输失败 -> 仍返回 false，主推理响应不受影响；不盲目切回 v1 重发，避免不确定消费后的重复批次。
+
+### 5. Good/Base/Bad Cases
+
+- Good：input=17、cache write=0，additional_metadata 中 inputTokens=17、uncachedInputTokens=0；event_data 顶层没有 token 字段。
+- Base：含未知 snapshotHash/未来字段的 wrapped 事件经过改写后仍保留这些字段，设备/auth/env 正确对齐。
+- Bad：只修改 URL 而保持平铺元数据，或只改路径判断却在 events[] 外壳上查找 env/auth。
+
+### 6. Tests Required
+
+- 双路径 × flat/wrapped，包含 ClaudeCodeInternalEvent 和 GrowthbookExperimentEvent，验证身份、嵌套 auth、base64 清理、未来字段与非法编码。
+- 自动批次真实 token/cache/request ID、SDK/未知入口、缺省上下文、不合成 startup/tool、多个 completion 的隔离。
+- 本地 HTTP 接收端只注册 v2 路径，检查发送的 OAuth header、UA、JSON envelope 和可解码 metadata；不得调用真实 Anthropic。
+
+### 7. Wrong vs Correct
+
+Wrong：`event_data.inputTokens = input`、`uncachedInputTokens = input + cache_write`。
+
+Correct：通用字段放 event_data，事件字段放 base64 JSON additional_metadata；`inputTokens = input`、`uncachedInputTokens = cache_write`。

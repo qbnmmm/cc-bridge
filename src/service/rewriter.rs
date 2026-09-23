@@ -74,6 +74,13 @@ pub fn classify_message_endpoint(path: &str) -> MessageEndpoint {
     }
 }
 
+pub fn is_event_batch_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/event_logging/batch" | "/api/event_logging/v2/batch"
+    )
+}
+
 /// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
 fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
     let mut seen = std::collections::HashSet::new();
@@ -376,7 +383,7 @@ impl Rewriter {
         if path.starts_with("/v1/messages") {
             strip_empty_text_blocks(&mut parsed);
             self.rewrite_messages(&mut parsed, account, client_type);
-        } else if path.contains("/event_logging/batch") {
+        } else if is_event_batch_path(path) {
             self.rewrite_event_batch(&mut parsed, account);
         } else if path.starts_with("/api/eval/") {
             self.rewrite_growthbook_eval(&mut parsed, account);
@@ -734,6 +741,17 @@ impl Rewriter {
                 Some(e) => e,
                 None => continue,
             };
+            let e = if e.contains_key("event_data") {
+                let Some(data) = e
+                    .get_mut("event_data")
+                    .and_then(serde_json::Value::as_object_mut)
+                else {
+                    continue;
+                };
+                data
+            } else {
+                e
+            };
 
             if e.contains_key("device_id") {
                 e.insert(
@@ -768,6 +786,27 @@ impl Rewriter {
                     );
                 } else {
                     e.remove("organization_uuid");
+                }
+            }
+
+            if let Some(auth) = e.get_mut("auth").and_then(serde_json::Value::as_object_mut) {
+                if auth.contains_key("account_uuid") {
+                    auth.insert(
+                        "account_uuid".into(),
+                        serde_json::Value::String(
+                            account
+                                .account_uuid
+                                .clone()
+                                .unwrap_or_else(|| derive_account_uuid(account)),
+                        ),
+                    );
+                }
+                if auth.contains_key("organization_uuid") {
+                    if let Some(ref org) = account.organization_uuid {
+                        auth.insert("organization_uuid".into(), serde_json::json!(org));
+                    } else {
+                        auth.remove("organization_uuid");
+                    }
                 }
             }
 
@@ -1581,6 +1620,7 @@ mod prompt_env_tests {
 mod header_profile_tests {
     use super::{ClientType, Rewriter};
     use crate::model::account::Account;
+    use base64::Engine;
     use chrono::Utc;
     use std::collections::HashMap;
 
@@ -1712,5 +1752,128 @@ mod header_profile_tests {
         let billing = output_body["system"][0]["text"].as_str().unwrap();
         assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.280."));
         assert!(billing.contains("cc_entrypoint=cli;"));
+    }
+
+    #[test]
+    fn event_batches_rewrite_flat_and_wrapped_payloads_on_both_paths() {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let mut account = account();
+        account.account_uuid = Some("canonical-account".into());
+        account.organization_uuid = Some("canonical-org".into());
+        let internal = serde_json::json!({
+            "event_name": "tengu_api_success",
+            "device_id": "original-device",
+            "email": "original@example.com",
+            "account_uuid": "original-account",
+            "organization_uuid": "original-org",
+            "auth": {"account_uuid": "original-account", "organization_uuid": "original-org", "future": true},
+            "env": {"version": "2.1.258"},
+            "process": engine.encode(br#"{"uptime":10,"rss":123,"future_process":true}"#),
+            "additional_metadata": engine.encode(br#"{"inputTokens":17,"uncachedInputTokens":0,"snapshotHash":"snapshot","future_metadata":{"ok":true},"baseUrl":"relay.example"}"#),
+            "future_event": [1, 2]
+        });
+        let growthbook = serde_json::json!({
+            "device_id": "original-device",
+            "auth": {"account_uuid": "original-account", "organization_uuid": "original-org"},
+            "user_attributes": r#"{"id":"original-device","email":"original@example.com","accountUUID":"original-account","organizationUUID":"original-org","apiBaseUrlHost":"relay.example","future_attr":true}"#
+        });
+        for path in ["/api/event_logging/batch", "/api/event_logging/v2/batch"] {
+            for wrapped in [false, true] {
+                let events = if wrapped {
+                    serde_json::json!([
+                        {"event_type": "ClaudeCodeInternalEvent", "event_data": internal},
+                        {"event_type": "GrowthbookExperimentEvent", "event_data": growthbook}
+                    ])
+                } else {
+                    serde_json::json!([internal, growthbook])
+                };
+                let output = Rewriter::new().rewrite_body(
+                    &serde_json::to_vec(&serde_json::json!({"events": events})).unwrap(),
+                    path,
+                    &account,
+                    ClientType::ClaudeCode,
+                );
+                let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                if wrapped {
+                    assert_eq!(output["events"][0]["event_type"], "ClaudeCodeInternalEvent");
+                    assert_eq!(
+                        output["events"][1]["event_type"],
+                        "GrowthbookExperimentEvent"
+                    );
+                }
+                let internal = if wrapped {
+                    &output["events"][0]["event_data"]
+                } else {
+                    &output["events"][0]
+                };
+                assert_eq!(internal["device_id"], account.device_id);
+                assert_eq!(internal["email"], account.email);
+                assert_eq!(internal["account_uuid"], "canonical-account");
+                assert_eq!(internal["organization_uuid"], "canonical-org");
+                assert_eq!(internal["auth"]["account_uuid"], "canonical-account");
+                assert_eq!(internal["auth"]["organization_uuid"], "canonical-org");
+                assert_eq!(internal["auth"]["future"], true);
+                assert_eq!(internal["env"]["version"], "2.1.280");
+                assert_eq!(internal["future_event"], serde_json::json!([1, 2]));
+                let process: serde_json::Value = serde_json::from_slice(
+                    &engine
+                        .decode(internal["process"].as_str().unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(process["uptime"], 10);
+                assert_eq!(process["future_process"], true);
+                let metadata: serde_json::Value = serde_json::from_slice(
+                    &engine
+                        .decode(internal["additional_metadata"].as_str().unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(metadata["inputTokens"], 17);
+                assert_eq!(metadata["uncachedInputTokens"], 0);
+                assert_eq!(metadata["snapshotHash"], "snapshot");
+                assert_eq!(metadata["future_metadata"]["ok"], true);
+                assert!(metadata.get("baseUrl").is_none());
+                let growthbook = if wrapped {
+                    &output["events"][1]["event_data"]
+                } else {
+                    &output["events"][1]
+                };
+                let attrs: serde_json::Value =
+                    serde_json::from_str(growthbook["user_attributes"].as_str().unwrap()).unwrap();
+                assert_eq!(attrs["id"], account.device_id);
+                assert_eq!(attrs["accountUUID"], "canonical-account");
+                assert_eq!(attrs["organizationUUID"], "canonical-org");
+                assert_eq!(attrs["future_attr"], true);
+                assert!(attrs.get("apiBaseUrlHost").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_batch_preserves_unparseable_fields_and_removes_stale_org() {
+        let account = account();
+        let input = serde_json::json!({"events": [
+            {"event_type": "ClaudeCodeInternalEvent", "event_data": {
+                "auth": {"organization_uuid": "old-org"},
+                "process": "not-base64",
+                "additional_metadata": "not-base64"
+            }},
+            {"event_data": null},
+            7
+        ]});
+        let output = Rewriter::new().rewrite_body(
+            &serde_json::to_vec(&input).unwrap(),
+            "/api/event_logging/v2/batch",
+            &account,
+            ClientType::ClaudeCode,
+        );
+        let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let event = &output["events"][0]["event_data"];
+        assert!(event["auth"].get("organization_uuid").is_none());
+        assert_eq!(event["process"], "not-base64");
+        assert_eq!(event["additional_metadata"], "not-base64");
+        assert_eq!(output["events"][1], input["events"][1]);
+        assert_eq!(output["events"][2], input["events"][2]);
     }
 }

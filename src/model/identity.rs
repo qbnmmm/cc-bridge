@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use super::account::{CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData};
 
-pub const CLAUDE_CODE_VERSION: &str = "2.1.258";
-pub const CLAUDE_CODE_BUILD_TIME: &str = "2026-09-01T21:54:40Z";
+pub const CLAUDE_CODE_VERSION: &str = "2.1.280";
+pub const CLAUDE_CODE_BUILD_TIME: &str = "2026-09-21T20:40:17Z";
 pub const CLAUDE_CODE_STAINLESS_VERSION: &str = "0.112.1";
 pub const CLAUDE_CODE_RUNTIME_VERSION: &str = "v26.3.0";
 

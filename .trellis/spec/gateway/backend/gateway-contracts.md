@@ -112,7 +112,7 @@ Correct：只使用 OAuth usage/实时 rate-limit 数据，并按实际存在的
 ### 1. Scope / Trigger
 
 - Trigger: changing the emulated Claude Code release, request headers, beta selection, canonical env or automatic telemetry profile.
-- Current verified darwin arm64 baseline: Claude Code `2.1.258`, build `2026-09-01T21:54:40Z`, Stainless `0.112.1`, runtime `node/v26.3.0`, Stainless OS `MacOS`.
+- Current release baseline: Claude Code `2.1.280`, build `2026-09-21T20:40:17Z`; release/build and Stainless `0.112.1` are verified in the darwin arm64 binary. Runtime `node/v26.3.0`, Stainless OS `MacOS`, beta and TLS behavior retain the previous profile pending a new wire capture.
 
 ### 2. Signatures
 
@@ -136,10 +136,11 @@ Correct：只使用 OAuth usage/实时 rate-limit 数据，并按实际存在的
 - Unknown incoming beta -> retain after known required beta values; invalid audit values are normalized to `other`.
 - Missing first-party request/session ID -> generate before forwarding and report an audit anomaly if still absent.
 - No direct ClientHello/JA3/JA4 evidence -> do not modify craftls or the product TLS fingerprint.
+- A new CLI can still receive an upstream minimum-version error if the bridge normalizes its UA/billing to an older release. Update the identity-owned release metadata together; existing-account reads already normalize stored release fields.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: `claude-cli/2.1.81 (external, sdk-cli)` becomes `claude-cli/2.1.258 (external, sdk-cli)` with Stainless `0.112.1` and body-aware beta values.
+- Good: `claude-cli/2.1.280 (external, cli)` with a stored 2.1.258 account stays at 2.1.280 in both outbound UA and billing; generated telemetry env uses the same release and build.
 - Base: a generic API request receives the canonical CLI header set and generated request/session IDs.
 - Bad: updating only the UA version while leaving `canonical_env=2.1.81`, Stainless `0.70.0`, or forcing every entrypoint to `cli`.
 
@@ -149,6 +150,7 @@ Correct：只使用 OAuth usage/实时 rate-limit 数据，并按实际存在的
 - Header tests cover UA suffix preservation, Stainless values and generated first-party IDs.
 - Beta tests cover Sonnet thinking+effort, Claude 4.5 Haiku order, legacy Claude 3 and `[1m]`.
 - Telemetry tests assert request entrypoint/thinking/effort and env/metrics release consistency.
+- The Opus 5.5 regression covers a 2.1.280 request through a stored 2.1.258 account, including billing rewrite and the `[1m]` model suffix.
 
 ### 7. Wrong vs Correct
 

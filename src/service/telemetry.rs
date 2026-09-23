@@ -1540,7 +1540,10 @@ mod tests {
     #[test]
     fn event_batch_events_have_consistent_identity() {
         // 同一 batch 里所有事件共享 device_id / email / auth，模拟单进程客户端
-        let account = make_account();
+        let mut account = make_account();
+        account.canonical_env["version"] = json!("2.1.258");
+        account.canonical_env["version_base"] = json!("2.1.258");
+        account.canonical_env["build_time"] = json!("2026-09-01T21:54:40Z");
         let batch = build_event_batch(ctx_for(&account, "claude-sonnet-4-5", "sid-x", 0, 0, true));
         let events = batch["events"].as_array().unwrap();
         let first_device = events[0]["event_data"]["device_id"].as_str().unwrap();
@@ -1548,6 +1551,12 @@ mod tests {
         for ev in events {
             assert_eq!(ev["event_data"]["device_id"].as_str(), Some(first_device));
             assert_eq!(ev["event_data"]["email"].as_str(), Some(first_email));
+            assert_eq!(ev["event_data"]["env"]["version"], "2.1.280");
+            assert_eq!(ev["event_data"]["env"]["version_base"], "2.1.280");
+            assert_eq!(
+                ev["event_data"]["env"]["build_time"],
+                "2026-09-21T20:40:17Z"
+            );
         }
     }
 

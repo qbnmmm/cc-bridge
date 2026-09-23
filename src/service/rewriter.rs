@@ -1644,7 +1644,7 @@ mod header_profile_tests {
         );
         assert_eq!(
             output.get("User-Agent").map(String::as_str),
-            Some("claude-cli/2.1.258 (external, sdk-cli, agent-sdk/1.2.3)")
+            Some("claude-cli/2.1.280 (external, sdk-cli, agent-sdk/1.2.3)")
         );
         assert_eq!(
             output
@@ -1667,5 +1667,50 @@ mod header_profile_tests {
             output.get("X-Claude-Code-Session-Id").map(String::as_str),
             Some("session")
         );
+    }
+
+    #[test]
+    fn opus_5_5_request_keeps_280_release_with_a_258_account() {
+        let mut account = account();
+        account.canonical_env["version"] = serde_json::json!("2.1.258");
+        account.canonical_env["version_base"] = serde_json::json!("2.1.258");
+        account.canonical_env["build_time"] = serde_json::json!("2026-09-01T21:54:40Z");
+        account.billing_mode = crate::model::account::BillingMode::Rewrite;
+        let headers = HashMap::from([(
+            "User-Agent".into(),
+            "claude-cli/2.1.280 (external, cli)".into(),
+        )]);
+        let body = serde_json::json!({
+            "model": "claude-opus-5-5[1m]",
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.1.280.abc; cc_entrypoint=cli; cch=00000;"
+            }],
+            "messages": [{"role": "user", "content": "OK"}]
+        });
+        let rewriter = Rewriter::new();
+        let output_headers = rewriter.rewrite_headers(
+            &headers,
+            &account,
+            ClientType::ClaudeCode,
+            "claude-opus-5-5[1m]",
+            &body,
+        );
+        let output_body = rewriter.rewrite_body(
+            &serde_json::to_vec(&body).unwrap(),
+            "/v1/messages",
+            &account,
+            ClientType::ClaudeCode,
+        );
+        let output_body: serde_json::Value = serde_json::from_slice(&output_body).unwrap();
+
+        assert_eq!(
+            output_headers.get("User-Agent").map(String::as_str),
+            Some("claude-cli/2.1.280 (external, cli)")
+        );
+        assert_eq!(output_body["model"], "claude-opus-5-5");
+        let billing = output_body["system"][0]["text"].as_str().unwrap();
+        assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.280."));
+        assert!(billing.contains("cc_entrypoint=cli;"));
     }
 }

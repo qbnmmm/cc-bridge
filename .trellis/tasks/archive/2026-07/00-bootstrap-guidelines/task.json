@@ -1,0 +1,32 @@
+{
+  "id": "00-bootstrap-guidelines",
+  "name": "00-bootstrap-guidelines",
+  "title": "Bootstrap Guidelines",
+  "description": "Build source-backed Trellis specs for gateway, web, and craftls",
+  "status": "completed",
+  "dev_type": "docs",
+  "scope": "trellis-infrastructure",
+  "package": "gateway",
+  "priority": "P1",
+  "creator": "仇炳楠",
+  "assignee": "仇炳楠",
+  "createdAt": "2026-07-27",
+  "completedAt": "2026-07-27",
+  "branch": null,
+  "base_branch": null,
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    ".trellis/config.yaml",
+    ".trellis/spec/gateway/",
+    ".trellis/spec/web/",
+    ".trellis/spec/craftls/",
+    ".trellis/spec/guides/"
+  ],
+  "notes": "First-time Trellis infrastructure bootstrap; no product development task or business code change",
+  "meta": {}
+}

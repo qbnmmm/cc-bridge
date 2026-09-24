@@ -248,6 +248,11 @@ export interface OAuthExchangeResult {
 }
 
 export const api = {
+  getPerformance: (params: PerformanceQuery, signal?: AbortSignal) => request<PerformanceReport>('GET', `/admin/performance?${performanceQuery(params)}`, undefined, signal),
+  getPerformanceActive: (params: PerformanceQuery, signal?: AbortSignal) => request<PerformanceActive>('GET', `/admin/performance/active?${performanceQuery(params)}`, undefined, signal),
+  getPerformanceRequests: (params: PerformanceQuery, signal?: AbortSignal) => request<PerformancePage>('GET', `/admin/performance/requests?${performanceQuery(params)}`, undefined, signal),
+  getPerformanceDetail: (id: string, signal?: AbortSignal) => request<PerformanceEvent>('GET', `/admin/performance/requests/${encodeURIComponent(id)}`, undefined, signal),
+  getPerformanceDimensions: (signal?: AbortSignal) => request<PerformanceDimensions>('GET', '/admin/performance/dimensions', undefined, signal),
   listAccounts: (page = 1, pageSize = 12) =>
     request<PagedResult<Account>>('GET', `/admin/accounts?page=${page}&page_size=${pageSize}`),
   createAccount: (a: Partial<Account>) => request<Account>('POST', '/admin/accounts', a),
@@ -283,4 +288,110 @@ export const api = {
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-code', { session_id: sessionId, code }),
   exchangeSetupTokenCode: (sessionId: string, code: string) =>
     request<OAuthExchangeResult>('POST', '/admin/oauth/exchange-setup-token-code', { session_id: sessionId, code }),
+}
+
+export type PerformanceOutcome = 'success' | 'local_error' | 'http_error' | 'send_error' | 'send_timeout' | 'read_timeout' | 'stream_error' | 'incomplete' | 'aborted' | 'unknown'
+export interface PerformanceEvent {
+  request_id: string
+  instance_id: string
+  started_at_utc: string
+  completed_at_utc: string | null
+  account_id: number | null
+  api_token_id: number | null
+  request_model: string | null
+  response_model: string | null
+  upstream_request_id: string | null
+  is_stream: boolean
+  upstream_status: number | null
+  downstream_status: number | null
+  outcome: PerformanceOutcome | null
+  observation_quality: string
+  stop_reason: string | null
+  phase: string
+  stages_ms: Record<string, number>
+  first_byte_ms: number | null
+  first_content_ms: number | null
+  first_text_ms: number | null
+  model_completed_ms: number | null
+  duration_ms: number | null
+  age_ms: number
+  content_idle_ms: number
+  max_content_gap_ms: number | null
+  output_tokens: number | null
+  output_tokens_per_second: number | null
+}
+export interface PerformanceHealth {
+  enabled: boolean
+  instance_id: string
+  since_utc: string
+  queue_depth: number
+  persisted_total: number
+  dropped_total: number
+  write_failed_total: number
+  active_tracking_dropped: number
+  parse_failed_total: number
+  retention_expired_total: number
+}
+export interface PerformancePercentiles {
+  sample_count: number
+  p50: number | null
+  p95: number | null
+  p99: number | null
+  max: number | null
+}
+export interface PerformanceCounts {
+  completed_count: number
+  success_count: number
+  error_count: number
+  aborted_count: number
+  unknown_count: number
+}
+export interface PerformanceReport {
+  start_ms: number
+  end_ms: number
+  bucket_ms: number
+  counts: PerformanceCounts
+  duration: PerformancePercentiles
+  first_byte: PerformancePercentiles
+  first_content: PerformancePercentiles
+  first_text: PerformancePercentiles
+  output_speed: PerformancePercentiles
+  buckets: Array<PerformanceCounts & { start_ms: number; duration: PerformancePercentiles; first_content: PerformancePercentiles }>
+  histogram: Array<{ label: string; duration_count: number; first_content_count: number }>
+  health: PerformanceHealth
+}
+export interface PerformancePage {
+  items: PerformanceEvent[]
+  total: number
+  page: number
+  page_size: number
+}
+export interface PerformanceActive extends PerformancePage {
+  scope: 'instance'
+  instance_id: string
+  since_utc: string
+  generated_at_utc: string
+  health: PerformanceHealth
+}
+export interface PerformanceDimensions extends UsageDimensions { instances: string[] }
+export interface PerformanceQuery {
+  start_at?: string
+  end_at?: string
+  account_id?: number
+  api_token_id?: number
+  model?: string
+  instance_id?: string
+  outcome?: PerformanceOutcome
+  is_stream?: boolean
+  min_duration_ms?: number
+  sort?: 'duration_desc' | 'created_at_desc'
+  page?: number
+  page_size?: number
+}
+function performanceQuery(params: PerformanceQuery): string {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== '') query.set(key, String(value))
+  }
+  return query.toString()
 }

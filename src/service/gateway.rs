@@ -1,3 +1,5 @@
+use crate::model::performance::PerformanceOutcome;
+use crate::service::performance::PerformanceHandle;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
@@ -144,6 +146,7 @@ impl GatewayService {
         req: Request,
         api_token: Option<&ApiToken>,
     ) -> Result<Response, AppError> {
+        let performance = req.extensions().get::<PerformanceHandle>().cloned();
         let rid = format!("{:08x}", rand::random::<u32>());
         let t_start = Instant::now();
         let mut t_prev = t_start;
@@ -155,6 +158,13 @@ impl GatewayService {
                     $name,
                     _now.duration_since(t_prev).as_secs_f64() * 1000.0,
                 );
+                if let Some(perf) = &performance {
+                    let name = match $name {
+                        "select_account" => "routing",
+                        other => other,
+                    };
+                    perf.stage(name, _now.duration_since(t_prev));
+                }
                 t_prev = _now;
             };
         }
@@ -185,6 +195,15 @@ impl GatewayService {
         };
 
         // 检测客户端类型
+        if let Some(perf) = &performance {
+            perf.request(
+                body_map.get("model").and_then(serde_json::Value::as_str),
+                body_map
+                    .get("stream")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            );
+        }
         let client_type = detect_client_type(&ua, &body_map);
 
         // 生成会话哈希
@@ -219,6 +238,9 @@ impl GatewayService {
                 )));
             }
         };
+        if let Some(perf) = &performance {
+            perf.account(account.id);
+        }
         cp!("select_account");
 
         // 自动遥测：拦截遥测请求 + 激活会话
@@ -366,6 +388,7 @@ impl GatewayService {
                 model_class,
                 usage_attempt,
                 audit_request,
+                performance.clone(),
             )
             .await?;
         cp!("forward_done");
@@ -414,6 +437,7 @@ impl GatewayService {
         model_class: crate::service::limit::ModelClass,
         mut usage_attempt: Option<UsageAttempt>,
         mut audit_request: Option<AuditRequestGuard<'_>>,
+        performance: Option<PerformanceHandle>,
     ) -> Result<Response, AppError> {
         let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
         if !query.is_empty() {
@@ -429,6 +453,9 @@ impl GatewayService {
 
         debug!("upstream URL: {}", target_url);
 
+        if let Some(perf) = &performance {
+            perf.phase("waiting_upstream");
+        }
         let tls_t0 = Instant::now();
         let client = crate::tlsfp::make_request_client(&account.proxy_url);
 
@@ -457,6 +484,13 @@ impl GatewayService {
         let resp = match req_builder.send().await {
             Ok(resp) => resp,
             Err(error) => {
+                if let Some(perf) = &performance {
+                    perf.failure(if error.is_timeout() {
+                        PerformanceOutcome::SendTimeout
+                    } else {
+                        PerformanceOutcome::SendError
+                    });
+                }
                 warn!("upstream error for account {}: {}", account.id, error);
                 if let Some(audit) = audit_request.take() {
                     audit.send_failed();
@@ -476,6 +510,17 @@ impl GatewayService {
         );
 
         let status_code = resp.status().as_u16();
+        if let Some(perf) = &performance {
+            perf.stage("upstream_headers", send_t0.elapsed());
+            perf.upstream(
+                status_code,
+                upstream_request_id(resp.headers()).as_deref(),
+                usage_response_is_stream(
+                    resp.headers(),
+                    usage_attempt.as_ref().is_some_and(|a| a.is_stream),
+                ),
+            );
+        }
         if let Some(audit) = audit_request.take() {
             audit.response(status_code);
         }
@@ -539,11 +584,24 @@ impl GatewayService {
 
         // 流式传输响应体，并把 SlotHolder 搭载到 body 流上：
         // 只有 body 被读完、或客户端提前断开（axum drop body）时，槽位才会释放。
+        let wrapped_error = status_code == 429 || (500..=599).contains(&status_code);
+        let observation = performance.filter(|_| !wrapped_error);
+        let read_performance = observation.clone();
+        let stream = resp.bytes_stream().map(move |result| {
+            if let (Some(perf), Err(error)) = (&read_performance, &result) {
+                perf.failure(if error.is_timeout() {
+                    PerformanceOutcome::ReadTimeout
+                } else {
+                    PerformanceOutcome::StreamError
+                });
+            }
+            result
+        });
         let body = if let Some(attempt) = usage_attempt {
-            let observed = self.usage_svc.observe_stream(resp.bytes_stream(), attempt);
-            if status_code == StatusCode::TOO_MANY_REQUESTS.as_u16()
-                || (500..=599).contains(&status_code)
-            {
+            let observed =
+                self.usage_svc
+                    .observe_stream_with_performance(stream, attempt, observation);
+            if wrapped_error {
                 drop(slot);
                 tokio::spawn(async move {
                     let mut observed = Box::pin(observed);
@@ -554,7 +612,7 @@ impl GatewayService {
                 Body::from_stream(SlotHeldStream::new(observed, slot))
             }
         } else {
-            Body::from_stream(SlotHeldStream::new(resp.bytes_stream(), slot))
+            Body::from_stream(SlotHeldStream::new(stream, slot))
         };
 
         response_builder

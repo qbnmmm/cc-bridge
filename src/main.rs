@@ -124,6 +124,13 @@ async fn main() {
     let token_tester = Arc::new(service::oauth::TokenTester::new());
     let oauth_flow_svc = Arc::new(service::oauth_flow::OAuthFlowService::new());
 
+    let performance_svc = service::performance::PerformanceService::start(
+        Arc::new(store::performance_store::PerformanceStore::new(
+            pool.clone(),
+        )),
+        cfg.performance_monitoring_enabled,
+    );
+
     let app = handler::router::build_router(
         &cfg,
         gateway_svc,
@@ -133,6 +140,7 @@ async fn main() {
         oauth_flow_svc,
         telemetry_svc,
         usage_svc,
+        performance_svc,
     );
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);

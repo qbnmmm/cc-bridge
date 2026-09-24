@@ -4,6 +4,7 @@ pub mod gateway;
 pub mod limit;
 pub mod oauth;
 pub mod oauth_flow;
+pub mod performance;
 pub mod rewriter;
 pub mod telemetry;
 pub mod usage;

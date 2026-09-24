@@ -445,7 +445,7 @@ mod tests {
     async fn sqlite_contract_covers_migration_dedup_aggregate_dimensions_and_retention() {
         let (store, path) = sqlite_store().await;
         let version: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 3")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 4")
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();

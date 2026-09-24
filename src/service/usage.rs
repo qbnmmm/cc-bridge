@@ -1,3 +1,4 @@
+use crate::service::performance::PerformanceHandle;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::pin::Pin;
@@ -249,9 +250,21 @@ impl UsageService {
     where
         S: Stream<Item = Result<Bytes, E>>,
     {
+        self.observe_stream_with_performance(stream, attempt, None)
+    }
+
+    pub fn observe_stream_with_performance<S, E>(
+        self: &Arc<Self>,
+        stream: S,
+        attempt: UsageAttempt,
+        performance: Option<PerformanceHandle>,
+    ) -> UsageObservedStream<S>
+    where
+        S: Stream<Item = Result<Bytes, E>>,
+    {
         UsageObservedStream {
             inner: Box::pin(stream),
-            observer: Some(ResponseObserver::new(self.clone(), attempt)),
+            observer: Some(ResponseObserver::new(self.clone(), attempt, performance)),
         }
     }
 
@@ -555,14 +568,25 @@ struct ResponseObserver {
     attempt: Option<UsageAttempt>,
     parser: EncodedResponseParser,
     first_byte_at: Option<Instant>,
+    performance: Option<PerformanceHandle>,
 }
 
 impl ResponseObserver {
-    fn new(service: Arc<UsageService>, attempt: UsageAttempt) -> Self {
+    fn new(
+        service: Arc<UsageService>,
+        attempt: UsageAttempt,
+        performance: Option<PerformanceHandle>,
+    ) -> Self {
         let response_parser = if attempt.is_stream {
-            ResponseParser::Sse(SseParser::default())
+            ResponseParser::Sse(SseParser {
+                performance: performance.clone(),
+                ..SseParser::default()
+            })
         } else {
-            ResponseParser::Json(JsonParser::default())
+            ResponseParser::Json(JsonParser {
+                performance: performance.clone(),
+                ..JsonParser::default()
+            })
         };
         let parser = EncodedResponseParser::new(response_parser, attempt.content_encoding);
         Self {
@@ -570,27 +594,41 @@ impl ResponseObserver {
             attempt: Some(attempt),
             parser,
             first_byte_at: None,
+            performance,
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
-        if self.attempt.is_none() {
+        if self.attempt.is_none() && self.performance.is_none() {
             return;
         }
         if !bytes.is_empty() && self.first_byte_at.is_none() {
             self.first_byte_at = Some(Instant::now());
         }
+        if let Some(perf) = &self.performance {
+            perf.bytes(bytes);
+        }
         self.parser.feed(bytes);
+        if self.parser.is_invalid() {
+            if let Some(perf) = &self.performance {
+                perf.parse_failed();
+            }
+        }
         if self.parser.is_complete() && self.parser.can_finalize_early() {
             self.finalize(false, false);
         }
     }
 
     fn finish(&mut self, client_dropped: bool) {
-        if self.attempt.is_none() {
+        if self.attempt.is_none() && self.performance.is_none() {
             return;
         }
         self.parser.finish(client_dropped);
+        if self.parser.is_invalid() {
+            if let Some(perf) = &self.performance {
+                perf.parse_failed();
+            }
+        }
         self.finalize(true, client_dropped);
     }
 
@@ -984,6 +1022,7 @@ impl ResponseParser {
 
 #[derive(Default)]
 struct JsonParser {
+    performance: Option<PerformanceHandle>,
     buffer: Vec<u8>,
     parsed: Option<ParsedUsage>,
     invalid: bool,
@@ -1009,10 +1048,15 @@ impl JsonParser {
             return;
         }
         match serde_json::from_slice::<Value>(&self.buffer) {
-            Ok(value) => match parse_json_response(&value) {
-                Ok(parsed) => self.parsed = Some(parsed),
-                Err(()) => self.invalid = true,
-            },
+            Ok(value) => {
+                if let Some(perf) = &self.performance {
+                    perf.observe_json(&value, false);
+                }
+                match parse_json_response(&value) {
+                    Ok(parsed) => self.parsed = Some(parsed),
+                    Err(()) => self.invalid = true,
+                }
+            }
             Err(_) => self.invalid = true,
         }
         self.buffer.clear();
@@ -1021,6 +1065,7 @@ impl JsonParser {
 
 #[derive(Default)]
 struct SseParser {
+    performance: Option<PerformanceHandle>,
     line: Vec<u8>,
     message_id: Option<String>,
     model: Option<String>,
@@ -1076,6 +1121,9 @@ impl SseParser {
             self.invalid = true;
             return;
         };
+        if let Some(perf) = &self.performance {
+            perf.observe_json(&value, true);
+        }
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 let Some(message) = value.get("message") else {
@@ -1567,6 +1615,137 @@ mod tests {
 
     fn zstd(bytes: &[u8]) -> Vec<u8> {
         zstd::stream::encode_all(bytes, 3).unwrap()
+    }
+
+    #[tokio::test]
+    async fn performance_observation_reuses_encoded_parser_without_changing_bytes() {
+        use crate::model::performance::PerformanceOutcome;
+        use axum::{body::Body, response::Response};
+        let (performance, mut completions) = crate::service::performance::test_service();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::store::db::migrate(&pool, "sqlite").await.unwrap();
+        let service = UsageService::start_without_pricing_refresh(
+            Arc::new(UsageStore::new(pool, "sqlite".into())),
+            PricingEngine::from_override_json(None).unwrap(),
+        )
+        .await;
+        let payload = b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"test\"}}\n\ndata: {\"type\":\"ping\"}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+        for encoding in [
+            UsageContentEncoding::Identity,
+            UsageContentEncoding::Gzip,
+            UsageContentEncoding::Deflate,
+            UsageContentEncoding::Brotli,
+            UsageContentEncoding::Zstd,
+        ] {
+            let encoded = match encoding {
+                UsageContentEncoding::Identity => payload.to_vec(),
+                UsageContentEncoding::Gzip => gzip(payload),
+                UsageContentEncoding::Deflate => deflate(payload),
+                UsageContentEncoding::Brotli => brotli(payload),
+                UsageContentEncoding::Zstd => zstd(payload),
+                UsageContentEncoding::Unsupported => unreachable!(),
+            };
+            let guard = performance.begin().unwrap();
+            guard.handle.request(Some("test"), true);
+            let mut attempt = UsageAttempt::begin(1, 1, "test".into(), true);
+            attempt.content_encoding = encoding;
+            let chunks: Vec<_> = encoded
+                .chunks(7)
+                .map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c)))
+                .collect();
+            let observed = service.observe_stream_with_performance(
+                futures_util::stream::iter(chunks),
+                attempt,
+                Some(guard.handle.clone()),
+            );
+            let response = guard.response(Response::new(Body::from_stream(observed)));
+            let received = axum::body::to_bytes(response.into_body(), 100000)
+                .await
+                .unwrap();
+            assert_eq!(&received[..], &encoded[..]);
+            let event = completions.try_recv().unwrap();
+            assert_eq!(
+                event.outcome,
+                Some(PerformanceOutcome::Success),
+                "{encoding:?}"
+            );
+            assert!(
+                event.first_byte_ms.is_some()
+                    && event.first_content_ms.is_some()
+                    && event.first_text_ms.is_some()
+            );
+            assert!(event.output_tokens.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn performance_survives_usage_finalization_and_detects_stream_errors() {
+        use crate::model::performance::PerformanceOutcome;
+        use axum::{body::Body, response::Response};
+        let (performance, mut completions) = crate::service::performance::test_service();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::store::db::migrate(&pool, "sqlite").await.unwrap();
+        let service = UsageService::start_without_pricing_refresh(
+            Arc::new(UsageStore::new(pool, "sqlite".into())),
+            PricingEngine::from_override_json(None).unwrap(),
+        )
+        .await;
+        for (payload, expected) in [
+            (
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n",
+                PerformanceOutcome::StreamError,
+            ),
+            ("data: not json\n\n", PerformanceOutcome::Unknown),
+            (
+                "data: {\"type\":\"message_start\",\"message\":{}}\n\n",
+                PerformanceOutcome::Incomplete,
+            ),
+        ] {
+            let guard = performance.begin().unwrap();
+            guard.handle.request(None, true);
+            let attempt = UsageAttempt::begin(1, 1, "test".into(), true);
+            let stream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                Bytes::copy_from_slice(payload.as_bytes()),
+            )]);
+            let observed = service.observe_stream_with_performance(
+                stream,
+                attempt,
+                Some(guard.handle.clone()),
+            );
+            let response = guard.response(Response::new(Body::from_stream(observed)));
+            let bytes = axum::body::to_bytes(response.into_body(), 10000)
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..], payload.as_bytes());
+            assert_eq!(completions.try_recv().unwrap().outcome, Some(expected));
+        }
+        let guard = performance.begin().unwrap();
+        guard.handle.request(None, true);
+        let stream=futures_util::stream::once(async {Ok::<_,std::io::Error>(Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\ndata: {\"type\":\"message_stop\"}\n\n"))}).chain(futures_util::stream::pending());
+        let observed = service.observe_stream_with_performance(
+            stream,
+            UsageAttempt::begin(1, 1, "test".into(), true),
+            Some(guard.handle.clone()),
+        );
+        let response = guard.response(Response::new(Body::from_stream(observed)));
+        let mut stream = response.into_body().into_data_stream();
+        stream.next().await.unwrap().unwrap();
+        assert!(
+            completions.try_recv().is_err(),
+            "usage finalization must not complete live performance request"
+        );
+        drop(stream);
+        let event = completions.try_recv().unwrap();
+        assert_eq!(event.outcome, Some(PerformanceOutcome::Aborted));
+        assert!(event.model_completed_ms.is_some());
     }
 
     #[test]

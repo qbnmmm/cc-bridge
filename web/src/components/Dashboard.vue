@@ -66,6 +66,8 @@ onMounted(loadDashboard);
             >
               用量
             </router-link>
+            <router-link :to="{ name: 'performance' }" class="px-3 py-1.5 text-sm rounded-lg transition-colors"
+              :class="route.name === 'performance' ? 'bg-[#c4704f]/10 text-[#c4704f] font-medium' : 'text-[#8c8475] hover:text-[#29261e] hover:bg-[#f0ebe4]'">性能</router-link>
           </nav>
         </div>
         <Button

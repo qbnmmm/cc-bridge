@@ -1,3 +1,5 @@
+use crate::service::performance::PerformanceService;
+use crate::service::rewriter::{MessageEndpoint, classify_message_endpoint};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -32,6 +34,7 @@ pub struct AppState {
     pub oauth_flow_svc: Arc<OAuthFlowService>,
     pub telemetry_svc: Arc<TelemetryService>,
     pub usage_svc: Arc<UsageService>,
+    pub performance_svc: Arc<PerformanceService>,
     pub admin_password: String,
 }
 
@@ -44,6 +47,7 @@ pub fn build_router(
     oauth_flow_svc: Arc<OAuthFlowService>,
     telemetry_svc: Arc<TelemetryService>,
     usage_svc: Arc<UsageService>,
+    performance_svc: Arc<PerformanceService>,
 ) -> Router {
     let state = AppState {
         gateway_svc,
@@ -53,6 +57,7 @@ pub fn build_router(
         oauth_flow_svc,
         telemetry_svc,
         usage_svc,
+        performance_svc,
         admin_password: cfg.admin.password.clone(),
     };
 
@@ -63,7 +68,8 @@ pub fn build_router(
         .route("/", get(spa_handler))
         .route("/login", get(spa_handler))
         .route("/tokens", get(spa_handler))
-        .route("/usage", get(spa_handler));
+        .route("/usage", get(spa_handler))
+        .route("/performance", get(spa_handler));
 
     // 前端静态资源
     let asset_routes = Router::new()
@@ -85,6 +91,20 @@ pub fn build_router(
             put(update_token).delete(delete_token_handler),
         )
         .route("/admin/dashboard", get(get_dashboard))
+        .route("/admin/performance", get(super::performance::overview))
+        .route("/admin/performance/active", get(super::performance::active))
+        .route(
+            "/admin/performance/requests",
+            get(super::performance::requests),
+        )
+        .route(
+            "/admin/performance/requests/:request_id",
+            get(super::performance::detail),
+        )
+        .route(
+            "/admin/performance/dimensions",
+            get(super::performance::dimensions),
+        )
         .route("/admin/usage", get(get_usage))
         .route("/admin/usage/dimensions", get(get_usage_dimensions))
         .route(
@@ -118,16 +138,53 @@ pub fn build_router(
 // --- Handlers ---
 
 /// 网关透传 fallback：鉴权 + 代理上游
-async fn gateway_fallback(State(state): State<AppState>, req: Request) -> Response {
-    let key = extract_key(&req);
-    if key.is_empty() {
-        return err_json(StatusCode::UNAUTHORIZED, "missing api key");
-    }
-    let api_token = match state.token_store.get_by_token(&key).await {
-        Ok(Some(t)) => t,
-        Ok(None) => return err_json(StatusCode::UNAUTHORIZED, "invalid api key"),
-        Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "authentication failed"),
+async fn gateway_fallback(State(state): State<AppState>, mut req: Request) -> Response {
+    let guard = if classify_message_endpoint(req.uri().path()) == MessageEndpoint::Inference {
+        state.performance_svc.begin()
+    } else {
+        None
     };
+    if let Some(guard) = &guard {
+        req.extensions_mut().insert(guard.handle.clone());
+    }
+    let response = gateway_authenticated(&state, req).await;
+    match guard {
+        Some(guard) => guard.response(response),
+        None => response,
+    }
+}
+
+async fn gateway_authenticated(state: &AppState, req: Request) -> Response {
+    let auth_start = std::time::Instant::now();
+    let performance = req
+        .extensions()
+        .get::<crate::service::performance::PerformanceHandle>()
+        .cloned();
+    let key = extract_key(&req);
+    let token_result = async {
+        if key.is_empty() {
+            return Err(err_json(StatusCode::UNAUTHORIZED, "missing api key"));
+        }
+        match state.token_store.get_by_token(&key).await {
+            Ok(Some(t)) => Ok(t),
+            Ok(None) => Err(err_json(StatusCode::UNAUTHORIZED, "invalid api key")),
+            Err(_) => Err(err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "authentication failed",
+            )),
+        }
+    }
+    .await;
+    if let Some(perf) = &performance {
+        perf.stage("auth", auth_start.elapsed());
+    }
+    let api_token = match token_result {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    if let Some(perf) = &performance {
+        perf.token(api_token.id);
+    }
     state
         .gateway_svc
         .handle_request(req, Some(&api_token))

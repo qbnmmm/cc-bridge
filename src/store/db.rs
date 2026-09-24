@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 pub async fn init_db(driver: &str, dsn: &str) -> Result<AnyPool, sqlx::Error> {
     if driver == "sqlite" {
@@ -230,6 +230,14 @@ pub async fn migrate(pool: &AnyPool, driver: &str) -> Result<(), sqlx::Error> {
                 .await
                 .ok();
         }
+    }
+
+    for statement in super::performance_store::PERFORMANCE_SCHEMA
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sqlx::query(statement).execute(pool).await?;
     }
 
     // Stamp the version last so a partial failure above causes a clean retry next boot.
@@ -592,7 +600,7 @@ mod tests {
             .await
             .unwrap();
         let version_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 3")
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 4")
                 .fetch_one(&pool)
                 .await
                 .unwrap();

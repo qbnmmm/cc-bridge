@@ -1,4 +1,5 @@
 pub mod account;
 pub mod api_token;
 pub mod identity;
+pub mod performance;
 pub mod usage;

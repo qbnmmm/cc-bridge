@@ -10,6 +10,7 @@ pub struct Config {
     pub log_level: String,
     pub log_dir: String,
     pub fingerprint_audit_enabled: bool,
+    pub performance_monitoring_enabled: bool,
     pub usage_pricing_overrides_json: Option<String>,
 }
 
@@ -138,6 +139,14 @@ impl Config {
                     "1" | "true" | "yes" | "on"
                 )
             }),
+            performance_monitoring_enabled: env_var("PERFORMANCE_MONITORING_ENABLED").is_none_or(
+                |value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                },
+            ),
             usage_pricing_overrides_json: env_var("USAGE_PRICING_OVERRIDES_JSON")
                 .filter(|value| !value.trim().is_empty()),
         }

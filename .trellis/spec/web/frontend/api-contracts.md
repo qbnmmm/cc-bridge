@@ -136,3 +136,7 @@ Correct：前端只发 `prompt_working_dir`，handler 就地更新已存在 JSON
 Wrong：在模板为每个模型硬编码永久行，并用 `?? 0` 填充缺失数据。
 
 Correct：先规范化实际返回的 scoped limits，再用 `v-for` 渲染存在的模型行。
+
+## 请求性能页面
+
+`/performance` 同时在 Vue 与后端 SPA 路由注册，API 定义在 api.ts。usePerformance 管理 active 5 秒/overview 60 秒轮询；页面隐藏/卸载暂停并 abort，旧响应不能覆盖新筛选结果，失败保留已有数据与更新时间。性能组件的 null 必须显示 `—`，不能当零；active 明确当前实例、与历史时间范围无关。首内容含思考/工具输入，首正文仅 text，完整时延分位数只计算完整成功且非空样本。请求取消只称“取消 / 响应释放”，不能指认责任方。后端字段、保留/鉴权和质量验证见 gateway/backend/performance-monitoring.md。

@@ -1,0 +1,33 @@
+{
+  "id": "request-performance-monitoring",
+  "name": "request-performance-monitoring",
+  "title": "请求性能监控与慢响应诊断",
+  "description": "参考 sub2api 增加性能概览、进行中请求与慢请求明细，区分首包、有效内容、正文、完整耗时及无进展时长，定位三十分钟级慢响应。",
+  "status": "in_progress",
+  "dev_type": "fullstack",
+  "scope": "performance-monitoring",
+  "package": "gateway",
+  "priority": "P2",
+  "creator": "仇炳楠",
+  "assignee": "仇炳楠",
+  "createdAt": "2026-09-24",
+  "completedAt": null,
+  "branch": "ccb",
+  "base_branch": "ccb",
+  "worktree_path": null,
+  "commit": "f7af909541ccabbb845296fd53932c2bb6fb3c4b",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "prd.md",
+    "design.md",
+    "implement.md",
+    "research/sub2api-and-current-state.md",
+    "validation.md",
+    "commit-plan.md"
+  ],
+  "notes": "实现与全部质量门完成；用户已授权提交、推送 GitHub 并由 CI 构建镜像，目标版本 1.8.3-qbn.11。",
+  "meta": {}
+}
